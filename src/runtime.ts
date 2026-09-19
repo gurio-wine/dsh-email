@@ -5,7 +5,7 @@ import { EmailSettingsSchema, SETTINGS_NAMESPACE, toEmailConfig, toSettingsBase,
 import type { EmailWatchResult } from './types.js'
 
 export type EmailClient = Pick<EmailPool,
-  'list' | 'read' | 'mark' | 'search' | 'send' | 'reply' | 'folders' | 'downloadAttachment' | 'startIdleSweep' | 'dispose'>
+  'list' | 'read' | 'mark' | 'search' | 'send' | 'reply' | 'folders' | 'downloadAttachment' | 'unseenUids' | 'fetchByUids' | 'startIdleSweep' | 'dispose'>
 
 export interface EmailSettingsScope {
   get(): unknown
@@ -97,26 +97,44 @@ export function createEmailRuntime(
 
   // Tool and browser watches share the implementation but never consume each
   // other's cursor. The first call per scope/account/folder seeds a baseline.
-  const watchCursors = new Map<string, number>()
+  const watchCursors = new Map<string, { uid: number; uidValidity: number }>()
   const watch = async (account: string, folder: string, limit: number, scope: string, signal?: AbortSignal): Promise<EmailWatchResult> => {
     const capped = clampInt(limit, 20, 1, 100)
-    const result = await getPool().list(account, folder, 100, 0, true, undefined, undefined, signal)
-    const key = scope + '\u0000' + result.account + '\u0000' + result.folder
-    const isFirst = !watchCursors.has(key)
-    const cursor = watchCursors.get(key) ?? 0
-    const fresh = result.messages.filter(message => message.uid > cursor)
-    if (result.messages.length > 0) {
-      watchCursors.set(key, Math.max(cursor, ...result.messages.map(message => message.uid)))
-    } else if (isFirst) {
-      watchCursors.set(key, 0)
+    const pool = getPool()
+    // 先只 SEARCH UNSEEN 拿 uid 列表与 totalUnread，再只为本轮要报告的最旧
+    // limit 封取信封：网页弹窗每 30 秒轮询一次，不能因为未读多就整批 FETCH。
+    const index = await pool.unseenUids(account, folder, signal)
+    const key = scope + '\u0000' + index.account + '\u0000' + index.folder
+    const stored = watchCursors.get(key)
+    const uidValidity = typeof index.uidValidity === 'number' ? index.uidValidity : 0
+    // A UIDVALIDITY change renumbers every message in the mailbox: keeping the
+    // old cursor would either report the whole folder as new or miss everything
+    // that renumbered below it. Re-seed the baseline instead and say so.
+    const reset = stored !== undefined && stored.uidValidity !== 0 && uidValidity !== 0 && stored.uidValidity !== uidValidity
+    const isFirst = stored === undefined || reset
+    const cursor = stored === undefined || reset ? 0 : stored.uid
+    const fresh = isFirst ? [] : index.uids.filter(uid => uid > cursor)
+    // 后续每次只返回 fresh 中最旧的 limit 条，游标也只推进到这批的最大 uid：
+    // 窗口里更旧的新邮件留给下一轮，不能因为本次只返回 limit 条就被永久跳过。
+    const batch = fresh.slice(Math.max(0, fresh.length - capped))
+    const messages = batch.length > 0 ? await pool.fetchByUids(account, folder, batch, signal) : []
+    if (isFirst) {
+      // 首次调用（或 UIDVALIDITY 重建）只落基线：游标取窗口最新一封，旧邮件不算新邮件。
+      watchCursors.set(key, {
+        uid: index.uids.length > 0 ? index.uids[0] : 0,
+        uidValidity,
+      })
+    } else if (batch.length > 0) {
+      watchCursors.set(key, { uid: Math.max(...batch), uidValidity })
     }
     return {
-      account: result.account,
-      folder: result.folder,
-      firstRun: isFirst,
-      newCount: isFirst ? 0 : fresh.length,
-      messages: (isFirst ? [] : fresh).slice(0, capped),
-      totalUnread: result.count,
+      account: index.account,
+      folder: index.folder,
+      firstRun: stored === undefined,
+      ...(reset ? { reset: true } : {}),
+      newCount: messages.length,
+      messages,
+      totalUnread: index.count,
     }
   }
   const dispose = (): void => {

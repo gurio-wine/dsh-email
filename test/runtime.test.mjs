@@ -38,7 +38,19 @@ function fixture(t, row = account) {
       async list(name, folder, ...args) {
         args.at(-1)?.throwIfAborted()
         state.operations.push({ method: 'list', args: [name, folder, ...args] })
-        return { account: name || settings.defaultAccount, folder: folder || 'INBOX', count: state.rows.length, messages: state.rows }
+        return { account: name || settings.defaultAccount, folder: folder || 'INBOX', count: state.rows.length, uidValidity: state.uidValidity ?? 0, messages: state.rows }
+      },
+      async unseenUids(name, folder, ...args) {
+        args.at(-1)?.throwIfAborted()
+        state.operations.push({ method: 'unseenUids', args: [name, folder, ...args] })
+        const uids = state.rows.map(row => row.uid).sort((a, b) => b - a)
+        return { account: name || settings.defaultAccount, folder: folder || 'INBOX', count: uids.length, uidValidity: state.uidValidity ?? 0, uids }
+      },
+      async fetchByUids(name, folder, uids, ...args) {
+        args.at(-1)?.throwIfAborted()
+        state.operations.push({ method: 'fetchByUids', args: [name, folder, uids, ...args] })
+        const byUid = new Map(state.rows.map(row => [row.uid, row]))
+        return uids.map(uid => byUid.get(uid)).filter(Boolean)
       },
     }
     for (const method of ['read', 'mark', 'search', 'send', 'reply', 'folders', 'downloadAttachment']) {
@@ -112,12 +124,33 @@ test('tool and web watches maintain independent baselines for each folder', asyn
   state.rows = [{ uid: 12 }, { uid: 11 }, { uid: 10 }]
   const tool = await runtime.watch('', '', 1, 'tool')
   const web = await runtime.watch('', '', 20, 'web')
-  assert.equal(tool.newCount, 2)
-  assert.deepEqual(tool.messages.map(message => message.uid), [12])
+  assert.equal(tool.newCount, 1)
+  assert.deepEqual(tool.messages.map(message => message.uid), [11]) // fresh 中最旧的 limit 条
+  const toolNext = await runtime.watch('', '', 1, 'tool')
+  assert.equal(toolNext.newCount, 1)
+  assert.deepEqual(toolNext.messages.map(message => message.uid), [12])
   assert.equal(web.newCount, 2)
   assert.deepEqual(web.messages.map(message => message.uid), [12, 11])
   assert.equal((await runtime.watch('', '', 20, 'tool')).newCount, 0)
   assert.equal((await runtime.watch('', 'Archive', 20, 'tool')).firstRun, true)
+})
+
+test('limit 小于新邮件数时按最旧优先分批补齐，连续调用一封不漏', async (t) => {
+  const { runtime, state } = fixture(t)
+  state.rows = [{ uid: 9 }]
+  assert.equal((await runtime.watch('', '', 20, 'tool')).firstRun, true)
+
+  state.rows = [{ uid: 12 }, { uid: 11 }, { uid: 10 }]
+  const seen = []
+  for (let i = 0; i < 3; i++) {
+    const batch = await runtime.watch('', '', 1, 'tool')
+    assert.ok(batch.messages.length <= 1, 'limit=1 时每次最多返回一条')
+    seen.push(...batch.messages.map(message => message.uid))
+  }
+  assert.deepEqual(seen, [10, 11, 12], '三封新邮件必须连续调用全部返回')
+  const idle = await runtime.watch('', '', 1, 'tool')
+  assert.equal(idle.newCount, 0)
+  assert.deepEqual(idle.messages, [])
 })
 
 test('cancelled watch reads do not advance the next successful baseline', async (t) => {
@@ -222,4 +255,30 @@ test('validateSettingsValue accepts the custom preset names in effect', async (t
   assert.doesNotThrow(() => validateSettingsValue(value, ['corp']))
   // The message still names everything that would be accepted.
   assert.throws(() => validateSettingsValue({ ...account, provider: 'nope' }, ['corp']), /corp/)
+})
+
+test('UIDVALIDITY 变化时重建基线，而不是把重编号的 uid 当成新邮件', async (t) => {
+  const { runtime, state } = fixture(t)
+  state.uidValidity = 111
+  state.rows = [{ uid: 10 }]
+  assert.equal((await runtime.watch('', '', 20, 'tool')).firstRun, true)
+
+  state.rows = [{ uid: 12 }, { uid: 11 }, { uid: 10 }]
+  assert.equal((await runtime.watch('', '', 20, 'tool')).newCount, 2)
+
+  // The server renumbered the mailbox: uids restart below the stored cursor.
+  state.uidValidity = 222
+  state.rows = [{ uid: 3 }, { uid: 2 }]
+  const reset = await runtime.watch('', '', 20, 'tool')
+  assert.equal(reset.reset, true)
+  assert.equal(reset.firstRun, false)
+  assert.equal(reset.newCount, 0)
+  assert.deepEqual(reset.messages, [])
+
+  // The reseeded baseline still spots the next arrival.
+  state.rows = [{ uid: 4 }, { uid: 3 }, { uid: 2 }]
+  const after = await runtime.watch('', '', 20, 'tool')
+  assert.equal(after.reset, undefined)
+  assert.equal(after.newCount, 1)
+  assert.deepEqual(after.messages.map((m) => m.uid), [4])
 })

@@ -5,6 +5,7 @@ import { isMap, parseDocument, type Document, type YAMLMap } from 'yaml'
 import { SETTINGS_NAMESPACE, toEmailConfig, validateSettingsValue, type EmailSettingsValue } from './settings.js'
 import {
   isOAuth2Account,
+  OUTLOOK_OAUTH2_CLIENT_ID,
   parseAccountsYaml,
   parseServerPresets,
   presetNamesIn,
@@ -17,13 +18,14 @@ import {
   type ServerPreset,
 } from './config.js'
 import {
+  clearTokenFor,
   getFreshAccessToken,
   oauth2StateOf,
   pollDeviceFlow,
   startDeviceFlow,
   type OAuth2State,
 } from './oauth2.js'
-import { EmailPool, messageOf } from './mail-client.js'
+import { EmailPool, messageOf, redactCredentials } from './mail-client.js'
 import type { ResolvedEmailConfig } from './config.js'
 import type { EmailWatchResult } from './types.js'
 
@@ -61,6 +63,36 @@ export interface AccountCardData {
    * login button instead of a 授权码, because Microsoft no longer accepts one.
    */
   authKind: 'oauth2' | 'password'
+  /**
+   * The `authKind` the account itself pins, when it pins one. `authKind` above
+   * is the effective verdict (which pane the editor shows); this is whether the
+   * user chose it, which is what the three-way selector has to render back —
+   * without it「自动」and「显式密码」look identical and the escape hatch is
+   * unreachable from the panel.
+   */
+  authKindDeclared?: 'oauth2' | 'password'
+  /**
+   * The application (client) id this account logs in through. Unlike a password
+   * this is not a secret — a public-client id travels in every device-code
+   * request — so the card carries the value itself and the editor can prefill
+   * it. Omitted when the account names none, which means the built-in
+   * registration below is the application that will be used.
+   */
+  clientId?: string
+  /**
+   * The application the login falls back to when the account names none: the
+   * community registration the plugin ships. Carried on the card so the editor
+   * can show which app the consent screen is about to name, instead of leaving
+   * the user to guess — and so「no id of its own」stops looking like an error
+   * that has to be fixed before a login can even start.
+   */
+  oauthDefaultClientId?: string
+  /** Display name for the From header, when the account sets one. */
+  senderName?: string
+  /** Login user when it differs from the visible address (`user`). */
+  authUser?: string
+  /** Whether a login password separate from `password` is stored. */
+  hasAuthPassword?: boolean
   /** Login state of an OAuth2 account: none / a device code in flight / logged in. */
   oauthState: OAuth2State
   /** The mailbox address the stored token belongs to (OAuth2 accounts only). */
@@ -92,6 +124,8 @@ interface Endpoint {
 /** One account card as the editor sends it back; every field is optional. */
 export interface AccountCardInput {
   name?: string
+  /** Persisted account key before a UI rename. */
+  originalName?: string
   provider?: string
   user?: string
   /**
@@ -101,6 +135,36 @@ export interface AccountCardInput {
    * 「删除」：那会让每一次无关的卡片保存都静默清掉用户已存的授权码。
    */
   password?: string | number | boolean
+  /**
+   * OAuth2 应用（客户端）ID，三态契约与 password 相同：undefined = 本卡片没提供
+   * （保留 YAML 里已存的 clientId 键），'' = 明确清除（回到内置的社区应用），非空 =
+   * 写入。留空不等于不能用：内置注册就是默认值，这一栏是把默认值换成自己的应用。
+   */
+  clientId?: string
+  /**
+   * 发件显示名，三态契约同 clientId：undefined = 本卡片没提供（保留已存的
+   * senderName 键），'' = 明确清除，非空 = 写入。只改收件人看到的名称，发件地址
+   * 始终是 user。
+   */
+  senderName?: string
+  /**
+   * 登录账号（IMAP/SMTP 认证用），三态契约同上：undefined = 保留，'' = 清除（回到
+   * 用 user 登录），非空 = 写入。别名/中继场景下 user 是发件地址，它才是登录名。
+   */
+  authUser?: string
+  /**
+   * 登录账号自己的密码，三态契约与 password 完全相同（undefined = 保留已存的值，
+   * '' = 明确清除，非空 = 写入）。只有 authUser 与 user 不同、且密码也不一样时
+   * 才需要。
+   */
+  authPassword?: string
+  /**
+   * 认证方式覆盖，三态契约同上：undefined = 本卡片没提供（保留已存的 authKind 键），
+   * '' = 明确恢复「自动」（删掉该键，回到按 provider/主机派生），非空 = 钉住。
+   * 这是给仍能用应用密码连 Exchange Online 的租户（混合/本地部署、SMTP AUTH 未关）
+   * 留的退路，没有它，这类账号升级后只会看到「尚未登录」且无处可改。
+   */
+  authKind?: string
   inboxFolder?: string
   imap?: { host?: string; port?: number; secure?: boolean }
   smtp?: { host?: string; port?: number; secure?: boolean }
@@ -112,13 +176,37 @@ export interface AccountCardInput {
  * Empty is a legitimate value — the card is the draft, not a validated config.
  */
 function endpointOf(
-  preset: ProviderPreset['imap'] | ServerPreset['imap'] | undefined,
+  preset: { host?: string; port?: number; secure?: boolean } | undefined,
   fallback: Endpoint,
 ): Endpoint {
   const host = typeof preset?.host === 'string' ? preset.host : fallback.host
   const port = typeof preset?.port === 'number' ? preset.port : fallback.port
   const secure = typeof preset?.secure === 'boolean' ? preset.secure : fallback.secure
   return { host, port, secure }
+}
+
+/**
+ * The endpoints a card shows, merged the way config resolution merges them: the
+ * account's own `host`/`port`/`secure` win over the preset's, because those are
+ * what the pool actually dials. A card that showed only the preset would name a
+ * host the plugin never connects to.
+ *
+ * The account mapping comes straight from user YAML, so every value is narrowed
+ * by type before it is merged — spreading a stray string or array would produce
+ * index keys rather than endpoints. A field of the wrong type is ignored here
+ * exactly as `endpointOf` ignores one in a preset.
+ */
+function accountEndpoint(
+  preset: ProviderPreset['imap'] | ServerPreset['imap'] | undefined,
+  own: unknown,
+  fallback: Endpoint,
+): Endpoint {
+  const declared = own !== null && typeof own === 'object' && !Array.isArray(own) ? own as Record<string, unknown> : {}
+  return endpointOf({
+    host: typeof declared.host === 'string' && declared.host !== '' ? declared.host : preset?.host,
+    port: typeof declared.port === 'number' ? declared.port : preset?.port,
+    secure: typeof declared.secure === 'boolean' ? declared.secure : preset?.secure,
+  }, fallback)
 }
 
 /**
@@ -148,11 +236,27 @@ function buildAccountCards(
       : {}
     const providerName = typeof account.provider === 'string' && account.provider !== '' ? account.provider : undefined
     const preset = providerName === undefined ? undefined : providerOf(providerName, presets)
-    const imap = endpointOf(preset?.imap, IMAP_FALLBACK)
+    const imap = accountEndpoint(preset?.imap, account.imap, IMAP_FALLBACK)
     // The same verdict resolution reaches: the provider, or the Exchange Online
-    // host a custom preset or a hand-written endpoint points at.
-    const authKind = isOAuth2Account(providerName, imap.host) ? 'oauth2' as const : 'password' as const
+    // host a custom preset or a hand-written endpoint points at. An account that
+    // pins `authKind` in its YAML outranks the derivation, exactly as it does in
+    // config resolution — a card that disagreed with the pool would offer an
+    // OAuth2 login for a mailbox that authenticates with a password.
+    const pinned = typeof account.authKind === 'string' ? account.authKind.trim().toLowerCase() : ''
+    const authKind: 'oauth2' | 'password' = pinned === 'oauth2' || pinned === 'password'
+      ? pinned
+      : isOAuth2Account(providerName, imap.host) ? 'oauth2' : 'password'
     const user = typeof account.user === 'string' ? account.user : ''
+    // A public-client id is not a secret, so unlike the password it is handed
+    // back for the editor to prefill: an account that names no application logs
+    // in with the built-in one, and the card has to say which that is.
+    const clientId = typeof account.clientId === 'string' ? account.clientId.trim() : ''
+    const oauthDefaultClientId = authKind === 'oauth2' && clientId === '' ? OUTLOOK_OAUTH2_CLIENT_ID : ''
+    // The display name and the login user are not secrets, so — like clientId —
+    // the card hands them back for the editor to prefill. A separate login
+    // password is a secret and only ever reported as a boolean.
+    const senderName = typeof account.senderName === 'string' ? account.senderName.trim() : ''
+    const authUser = typeof account.authUser === 'string' ? account.authUser.trim() : ''
     const oauth = authKind === 'oauth2' ? tokens(name, user) : { state: 'none' as OAuth2State }
     list.push({
       name,
@@ -161,10 +265,16 @@ function buildAccountCards(
       user,
       hasPassword: typeof account.password === 'string' && account.password !== '',
       authKind,
+      ...(pinned === 'oauth2' || pinned === 'password' ? { authKindDeclared: pinned } : {}),
+      ...(clientId !== '' ? { clientId } : {}),
+      ...(oauthDefaultClientId !== '' ? { oauthDefaultClientId } : {}),
+      ...(senderName !== '' ? { senderName } : {}),
+      ...(authUser !== '' ? { authUser } : {}),
+      ...(typeof account.authPassword === 'string' && account.authPassword !== '' ? { hasAuthPassword: true } : {}),
       oauthState: oauth.state,
       ...(oauth.user !== undefined ? { oauthUser: oauth.user } : {}),
       imap,
-      smtp: endpointOf(preset?.smtp, SMTP_FALLBACK),
+      smtp: accountEndpoint(preset?.smtp, account.smtp, SMTP_FALLBACK),
       inboxFolder: typeof account.inboxFolder === 'string' && account.inboxFolder !== '' ? account.inboxFolder : 'INBOX',
       isDefault: name === defaultAccount,
     })
@@ -249,7 +359,6 @@ function isBlankAccountsText(text: string): boolean {
 }
 
 interface AccountsDraft {
-  raw: Record<string, unknown>
   defaultAccount?: string
   error?: string
   list: AccountCardData[]
@@ -259,6 +368,10 @@ interface AccountsDraft {
  * Parse accountsYaml text into cards. Never throws: the editor calls this on
  * every keystroke, so a half-typed document is the normal case and comes back
  * as an error field rather than as an HTTP failure.
+ *
+ * The parsed mapping stays inside this function. It carries plaintext
+ * passwords, and the editor only ever consumes the cards — which project
+ * `hasPassword` instead of the secret — so no raw account leaves here.
  */
 function readAccountsDraft(
   text: string,
@@ -268,7 +381,7 @@ function readAccountsDraft(
 ): AccountsDraft {
   if (isBlankAccountsText(text)) {
     const { defaultAccount, error } = adjudicateAccounts({}, undefined, rowDefault)
-    return { raw: {}, ...(defaultAccount !== undefined ? { defaultAccount } : {}), list: [], ...(error !== undefined ? { error } : {}) }
+    return { ...(defaultAccount !== undefined ? { defaultAccount } : {}), list: [], ...(error !== undefined ? { error } : {}) }
   }
   let raw: Record<string, unknown> = {}
   let yamlDefault: string | undefined
@@ -278,11 +391,10 @@ function readAccountsDraft(
     yamlDefault = parsed.defaultAccount
   } catch (caught) {
     // No mapping could be read: report it and hand back an empty draft.
-    return { raw: {}, list: [], error: messageOf(caught, 'accountsYaml 解析失败') }
+    return { list: [], error: messageOf(caught, 'accountsYaml 解析失败') }
   }
   const verdict = adjudicateAccounts(raw, yamlDefault, rowDefault)
   return {
-    raw,
     ...(verdict.defaultAccount !== undefined ? { defaultAccount: verdict.defaultAccount } : {}),
     list: buildAccountCards(raw, verdict.defaultAccount, presets, tokens),
     ...(verdict.error !== undefined ? { error: verdict.error } : {}),
@@ -400,6 +512,7 @@ function normalizeCardForYaml(
   card: AccountCardInput,
   customNames: ReadonlySet<string>,
   inheritedPassword?: unknown,
+  inheritedAuthPassword?: unknown,
 ): Record<string, unknown> {
   const out: Record<string, unknown> = {}
   const provider = persistedProvider(card.provider, customNames)
@@ -415,16 +528,51 @@ function normalizeCardForYaml(
       ? String(card.password)
       : card.password
   }
+  // Same three-state contract as the in-place writer: a card that does not
+  // model the field says nothing about it, '' clears it, a value is written
+  // trimmed. Losing this on the degraded path would silently log the account
+  // out of its application.
+  if (card.clientId !== undefined) {
+    const clientId = String(card.clientId).trim()
+    if (clientId !== '') out.clientId = clientId
+  }
+  // '' means「back to automatic」, which is the absence of the key.
+  if (card.authKind !== undefined) {
+    const authKind = String(card.authKind).trim().toLowerCase()
+    if (authKind !== '') out.authKind = authKind
+  }
   if (card.inboxFolder !== undefined) out.inboxFolder = card.inboxFolder
+  if (card.senderName !== undefined) {
+    const senderName = String(card.senderName).trim()
+    if (senderName !== '') out.senderName = senderName
+  }
+  if (card.authUser !== undefined) {
+    const authUser = String(card.authUser).trim()
+    if (authUser !== '') out.authUser = authUser
+  }
+  if (card.authPassword === undefined) {
+    // Same contract as password: a card that says nothing must not delete it.
+    if (inheritedAuthPassword !== undefined) out.authPassword = inheritedAuthPassword
+  } else if (card.authPassword !== '') {
+    out.authPassword = String(card.authPassword)
+  }
   return out
 }
 
-/** The `password` stored in the source YAML for one account, if the key is there. */
-function storedPasswordOf(raw: Record<string, unknown>, name: string): { present: boolean; value: unknown } {
+/** One secret key stored in the source YAML for one account, if it is there. */
+function storedSecretOf(raw: Record<string, unknown>, name: string, key: string): { present: boolean; value: unknown } {
   const account = raw[name]
   if (account === null || typeof account !== 'object' || Array.isArray(account)) return { present: false, value: undefined }
-  if (!Object.prototype.hasOwnProperty.call(account, 'password')) return { present: false, value: undefined }
-  return { present: true, value: (account as Record<string, unknown>).password }
+  if (!Object.prototype.hasOwnProperty.call(account, key)) return { present: false, value: undefined }
+  return { present: true, value: (account as Record<string, unknown>)[key] }
+}
+
+function storedPasswordOf(raw: Record<string, unknown>, name: string): { present: boolean; value: unknown } {
+  return storedSecretOf(raw, name, 'password')
+}
+
+function storedAuthPasswordOf(raw: Record<string, unknown>, name: string): { present: boolean; value: unknown } {
+  return storedSecretOf(raw, name, 'authPassword')
 }
 
 /**
@@ -455,14 +603,17 @@ function fallbackSerialize(
   for (const card of cards) {
     const name = card.name as string
     let inherited: unknown
+    let inheritedAuthPassword: unknown
     if (stored === undefined) {
       // Nothing could be read back: a silent card may be losing a real secret.
       if (card.password === undefined) passwordsDropped = true
     } else {
       const { present, value } = storedPasswordOf(stored, name)
       if (present) inherited = value
+      const auth = storedAuthPasswordOf(stored, name)
+      if (auth.present) inheritedAuthPassword = auth.value
     }
-    raw[name] = normalizeCardForYaml(card, customNames, inherited)
+    raw[name] = normalizeCardForYaml(card, customNames, inherited, inheritedAuthPassword)
   }
   return {
     accountsYaml: serializeAccountsYaml(raw, defaultAccount),
@@ -501,6 +652,21 @@ function serializeAccountsDraft(
   }
 
   const desired = new Set(cards.map(card => card.name as string))
+  if (desired.size !== cards.length) throw new Error('账号名重复，不能覆盖已有账号')
+  // Rename the YAML node before filtering, retaining secrets and advanced keys.
+  // originalName may already have been renamed by a preceding auto-save.
+  const renameTargets = new Set<string>()
+  for (const card of cards) {
+    const from = card.originalName
+    const to = card.name as string
+    if (!from || from === to || !root.has(from)) continue
+    if (root.has(to) || renameTargets.has(from)) throw new Error('账号名已存在，不能覆盖已有账号')
+    const pair = root.items.find(item => keyTextOf(item) === from)
+    if (pair !== undefined) {
+      pair.key = doc.createNode(to)
+      renameTargets.add(from)
+    }
+  }
   const seen = new Set<string>()
   for (const pair of [...root.items]) {
     const name = keyTextOf(pair)
@@ -528,8 +694,26 @@ function serializeAccountsDraft(
     // The provider is the account's whole connection identity: a resolvable
     // preset name is written, anything else deletes the key. Endpoints are
     // never written — a stored copy is washed out below instead.
-    writeField(account, 'provider', persistedProvider(card.provider, customNames))
+    const previousProvider = account.get('provider')
+    const nextProvider = persistedProvider(card.provider, customNames)
+    writeField(account, 'provider', nextProvider)
     writeField(account, 'user', card.user)
+    // senderName / authUser are plain three-state fields (undefined = 保持原样,
+    // '' = 清除, 非空 = 写入) — writeField already implements exactly that.
+    // An undefined field means "this card says nothing" — writeField would read
+    // that as「delete」, so the guard has to live here, not inside it.
+    if (card.senderName !== undefined) writeField(account, 'senderName', String(card.senderName).trim())
+    if (card.authUser !== undefined) writeField(account, 'authUser', String(card.authUser).trim())
+    // authPassword is a secret and follows the password contract verbatim: the
+    // card never carries the plaintext, so an omitted field must leave the
+    // stored key — value, position and comment — untouched.
+    if (card.authPassword === undefined) {
+      // 未提供 = 保持原样：什么都不写。
+    } else if (card.authPassword === '') {
+      account.delete('authPassword')
+    } else {
+      account.set('authPassword', String(card.authPassword))
+    }
     // Password is three-state, unlike every other field: the card is never given
     // the plaintext (snapshot exposes hasPassword only), so an omitted password
     // means "the editor has nothing to say" and the stored key must survive
@@ -545,12 +729,31 @@ function serializeAccountsDraft(
         ? String(card.password)
         : card.password)
     }
+    // clientId is three-state for the same reason: a card that does not model
+    // the field — a password account, an older editor — has nothing to say about
+    // it, and a value the user typed into the YAML must survive an unrelated
+    // save. Only an explicit '' clears it.
+    if (card.clientId === undefined) {
+      // 未提供 = 保持原样：什么都不写。
+    } else {
+      writeField(account, 'clientId', String(card.clientId).trim())
+    }
+    // Same three states, and here '' is meaningful rather than merely empty: it
+    // takes the pin back off, returning the account to the derivation.
+    if (card.authKind !== undefined) {
+      writeField(account, 'authKind', String(card.authKind).trim().toLowerCase())
+    }
     writeField(account, 'inboxFolder', card.inboxFolder)
-    // Endpoints are washed, not written: an account is a provider id, and a
-    // hand-written host/port/secure in an older YAML is exactly the stale copy
-    // this migration removes.
-    washEndpoint(account, 'imap')
-    washEndpoint(account, 'smtp')
+    // Endpoints are never written by a card: they come from the preset, or from
+    // what the account already stores. They are washed only when the provider
+    // actually changed, because that is the one case where the stored copy is
+    // stale by definition — it belongs to the previous provider. Washing on
+    // every save would repoint a self-hosted account at the preset merely
+    // because the user opened this panel.
+    if (nextProvider !== undefined && nextProvider !== previousProvider) {
+      washEndpoint(account, 'imap')
+      washEndpoint(account, 'smtp')
+    }
   }
 
   if (defaultAccount !== '') root.set('defaultAccount', defaultAccount)
@@ -617,6 +820,96 @@ function findWhaleAsset(): WhaleAsset | null {
 }
 
 /**
+ * The account names a settings value carries, or `undefined` when the document
+ * could not be read.
+ *
+ * Three states on purpose. An empty text really does mean "no accounts", but an
+ * unparseable one means "no idea" — and a caller that confused the two would
+ * treat every account as deleted and wipe their stored OAuth2 tokens.
+ */
+function accountNamesOf(value: EmailSettingsValue | undefined): Set<string> | undefined {
+  const text = typeof value?.accountsYaml === 'string' ? value.accountsYaml : ''
+  if (text.trim() === '') return new Set()
+  try {
+    return new Set(Object.keys(parseAccountsYaml(text).map))
+  } catch {
+    return undefined
+  }
+}
+
+/** Hostnames a browser may legitimately reach this route through. */
+const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '[::1]', '::1'])
+
+/**
+ * Verdict on the `Host` header: `undefined` to proceed, otherwise the reason to
+ * refuse.
+ *
+ * The localhost gate on `socket.remoteAddress` proves where the packets came
+ * from, not which name the browser believes it is talking to. A page the user
+ * visits can point a domain at 127.0.0.1 (DNS rebinding); that request looks
+ * same-origin to the browser, carries no `Origin`, and would make the snapshot
+ * readable — and the snapshot carries `accountsYaml`, plaintext 授权码 included.
+ * Requiring a localhost `Host` closes it.
+ *
+ * A request with no `Host` at all did not come from a browser (HTTP/1.0, curl,
+ * the test harness), and the remote-address gate still applies to it.
+ */
+export function hostVerdict(host: unknown): string | undefined {
+  if (typeof host !== 'string' || host.trim() === '') return undefined
+  const text = host.trim().toLowerCase()
+  // An IPv6 literal arrives bracketed — `[::1]:3080` — where splitting on the
+  // colon would leave「[」and refuse a legitimate way to reach the panel.
+  const name = text.startsWith('[') ? text.slice(0, text.indexOf(']') + 1) : text.split(':')[0]!
+  return LOCAL_HOSTNAMES.has(name) ? undefined : `host "${host}" is not a localhost name`
+}
+
+/**
+ * Verdict on a state-changing POST: `undefined` to proceed, otherwise the status
+ * and reason to refuse.
+ *
+ * Cross-origin writes are the hole the remote-address gate cannot see: a browser
+ * page may POST here as a「simple request」(text/plain, no preflight) and change
+ * settings or trigger a dial. Three independent checks close it:
+ *
+ * - `application/json` is not a simple-request content type, so a cross-origin
+ *   caller is forced into a preflight, which this route never answers with
+ *   `Access-Control-Allow-Origin`.
+ * - `Origin`, when it names an http(s) page, must be a localhost origin. Other
+ *   schemes are left to the next check: the host may load its UI through a
+ *   custom protocol, and a hostile page cannot produce one.
+ * - `Sec-Fetch-Site`, when present, must be `same-origin` (or `none`, a
+ *   user-initiated navigation with no referrer). This is what catches an opaque
+ *   `Origin: null` from a sandboxed iframe.
+ *
+ * Headers a non-browser client omits are not fabricatable by page script, so
+ * their absence is allowed rather than treated as a rejection.
+ */
+export function postVerdict(headers: Record<string, unknown>): { status: number; message: string } | undefined {
+  const contentType = String(headers['content-type'] ?? '')
+  if (!contentType.toLowerCase().includes('application/json')) {
+    return { status: 415, message: 'dsh-email settings route accepts application/json only' }
+  }
+  const origin = headers.origin
+  if (typeof origin === 'string' && origin.trim() !== '') {
+    let url: URL | undefined
+    try {
+      url = new URL(origin)
+    } catch {
+      url = undefined
+    }
+    if (url !== undefined && (url.protocol === 'http:' || url.protocol === 'https:')
+      && !LOCAL_HOSTNAMES.has(url.hostname.toLowerCase())) {
+      return { status: 403, message: `origin "${origin}" is not allowed to write dsh-email settings` }
+    }
+  }
+  const site = headers['sec-fetch-site']
+  if (typeof site === 'string' && site !== '' && site !== 'same-origin' && site !== 'none') {
+    return { status: 403, message: `a ${site} request may not write dsh-email settings` }
+  }
+  return undefined
+}
+
+/**
  * Browser-facing backend: snapshot the settings namespace, save it with
  * optimistic concurrency, and test a draft account over a live IMAP login.
  */
@@ -659,7 +952,6 @@ export class EmailSettingsBackend {
       writable: this.ctx.settings.writable !== false,
       accounts: [...(this.effectiveAccounts().keys())],
       accountsDetail: {
-        raw: draft.raw,
         ...(draft.defaultAccount !== undefined ? { defaultAccount: draft.defaultAccount } : {}),
         list: draft.list,
         ...(draft.error !== undefined ? { error: draft.error } : {}),
@@ -684,7 +976,20 @@ export class EmailSettingsBackend {
     // The provider dropdown offers the custom preset names, so a value naming
     // one of them is a legal choice rather than an unknown provider.
     validateSettingsValue(value, presetNamesIn(value?.serverPresets ?? this.scope.get()?.serverPresets))
+    const before = accountNamesOf(this.scope.get() as EmailSettingsValue)
     await this.ctx.settings.replace(SETTINGS_NAMESPACE, value, expectedRevision)
+    // A deleted account must not leave its refresh token behind: the store is
+    // keyed by account name, so the credential of a mailbox that is no longer
+    // configured would sit on disk, and a later account reusing that name would
+    // inherit it. Only once the write has committed — a draft, or a 409, must
+    // not cost anybody their login. And never on an unreadable document: not
+    // knowing the new account list is not the same as knowing it is empty.
+    const after = accountNamesOf(value)
+    if (before !== undefined && after !== undefined) {
+      for (const name of before) {
+        if (!after.has(name)) clearTokenFor(name)
+      }
+    }
     return this.snapshot()
   }
 
@@ -729,11 +1034,15 @@ export class EmailSettingsBackend {
       return { ok: true, ms: Date.now() - started, ...target }
     } catch (error) {
       // imapflow reports failed LOGIN as a bare "Command failed"; surface an
-      // actionable hint instead of the opaque message.
-      const raw = messageOf(error, 'unknown error')
+      // actionable hint instead of the opaque message. The server's own text is
+      // redacted first: a refused authentication string is echoed verbatim by
+      // many servers, and for XOAUTH2 that blob carries the access token.
+      const raw = redactCredentials(messageOf(error, 'unknown error'))
       const lower = raw.toLowerCase()
       if (lower.includes('command failed') || lower.includes('authentication') || lower.includes('login')) {
-        throw new Error('邮箱登录失败：请检查邮箱地址与授权码（' + raw + '）')
+        throw new Error(cfg.authKind === 'oauth2'
+          ? '邮箱登录失败：请在设置页重新完成设备码登录（' + raw + '）'
+          : '邮箱登录失败：请检查邮箱地址与授权码（' + raw + '）')
       }
       throw error
     } finally {
@@ -782,7 +1091,7 @@ export class EmailSettingsBackend {
       const { name: account, cfg } = this.oauthAccount(name, 'oauthLogin')
       // Same verdict the card renders: a token belonging to a different
       // address is not a login for this account, so it starts a fresh flow.
-      const state = oauth2StateOf(account, cfg.user)
+      const state = oauth2StateOf(account, cfg.user, cfg.clientId ?? '')
       if (state.state === 'logged-in') return { ok: true, status: 'already' }
       const start = await startDeviceFlow(account, cfg)
       return {
@@ -835,6 +1144,28 @@ export class EmailSettingsBackend {
     if (remote !== '127.0.0.1' && remote !== '::1' && remote !== '::ffff:127.0.0.1') {
       this.responseJson(res, 403, { ok: false, error: { code: 'forbidden', message: 'dsh-email settings route is localhost-only' } })
       return
+    }
+    // Localhost is where the packets came from, not which name the browser thinks
+    // it reached: a rebound domain resolves to 127.0.0.1 and would otherwise read
+    // the snapshot, `accountsYaml` and its plaintext 授权码 included.
+    const headers = (req.headers ?? {}) as Record<string, unknown>
+    const host = hostVerdict(headers.host)
+    if (host !== undefined) {
+      this.responseJson(res, 403, { ok: false, error: { code: 'forbidden', message: host } })
+      return
+    }
+    if (req.method === 'POST') {
+      // A page the user visits can POST here cross-origin as a「simple request」
+      // and change settings or trigger a dial; these headers are the part of that
+      // a page script cannot forge away.
+      const post = postVerdict(headers)
+      if (post !== undefined) {
+        this.responseJson(res, post.status, {
+          ok: false,
+          error: { code: post.status === 415 ? 'unsupported-media-type' : 'forbidden', message: post.message },
+        })
+        return
+      }
     }
     if (req.method === 'GET') {
       try {
@@ -896,7 +1227,6 @@ export class EmailSettingsBackend {
           value: {
             ok: draft.error === undefined,
             ...(draft.error !== undefined ? { error: draft.error } : {}),
-            raw: draft.raw,
             ...(draft.defaultAccount !== undefined ? { defaultAccount: draft.defaultAccount } : {}),
             list: draft.list,
           },

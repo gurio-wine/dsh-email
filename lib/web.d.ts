@@ -24,6 +24,36 @@ export interface AccountCardData {
      * login button instead of a 授权码, because Microsoft no longer accepts one.
      */
     authKind: 'oauth2' | 'password';
+    /**
+     * The `authKind` the account itself pins, when it pins one. `authKind` above
+     * is the effective verdict (which pane the editor shows); this is whether the
+     * user chose it, which is what the three-way selector has to render back —
+     * without it「自动」and「显式密码」look identical and the escape hatch is
+     * unreachable from the panel.
+     */
+    authKindDeclared?: 'oauth2' | 'password';
+    /**
+     * The application (client) id this account logs in through. Unlike a password
+     * this is not a secret — a public-client id travels in every device-code
+     * request — so the card carries the value itself and the editor can prefill
+     * it. Omitted when the account names none, which means the built-in
+     * registration below is the application that will be used.
+     */
+    clientId?: string;
+    /**
+     * The application the login falls back to when the account names none: the
+     * community registration the plugin ships. Carried on the card so the editor
+     * can show which app the consent screen is about to name, instead of leaving
+     * the user to guess — and so「no id of its own」stops looking like an error
+     * that has to be fixed before a login can even start.
+     */
+    oauthDefaultClientId?: string;
+    /** Display name for the From header, when the account sets one. */
+    senderName?: string;
+    /** Login user when it differs from the visible address (`user`). */
+    authUser?: string;
+    /** Whether a login password separate from `password` is stored. */
+    hasAuthPassword?: boolean;
     /** Login state of an OAuth2 account: none / a device code in flight / logged in. */
     oauthState: OAuth2State;
     /** The mailbox address the stored token belongs to (OAuth2 accounts only). */
@@ -44,6 +74,8 @@ export interface AccountCardData {
 /** One account card as the editor sends it back; every field is optional. */
 export interface AccountCardInput {
     name?: string;
+    /** Persisted account key before a UI rename. */
+    originalName?: string;
     provider?: string;
     user?: string;
     /**
@@ -53,6 +85,36 @@ export interface AccountCardInput {
      * 「删除」：那会让每一次无关的卡片保存都静默清掉用户已存的授权码。
      */
     password?: string | number | boolean;
+    /**
+     * OAuth2 应用（客户端）ID，三态契约与 password 相同：undefined = 本卡片没提供
+     * （保留 YAML 里已存的 clientId 键），'' = 明确清除（回到内置的社区应用），非空 =
+     * 写入。留空不等于不能用：内置注册就是默认值，这一栏是把默认值换成自己的应用。
+     */
+    clientId?: string;
+    /**
+     * 发件显示名，三态契约同 clientId：undefined = 本卡片没提供（保留已存的
+     * senderName 键），'' = 明确清除，非空 = 写入。只改收件人看到的名称，发件地址
+     * 始终是 user。
+     */
+    senderName?: string;
+    /**
+     * 登录账号（IMAP/SMTP 认证用），三态契约同上：undefined = 保留，'' = 清除（回到
+     * 用 user 登录），非空 = 写入。别名/中继场景下 user 是发件地址，它才是登录名。
+     */
+    authUser?: string;
+    /**
+     * 登录账号自己的密码，三态契约与 password 完全相同（undefined = 保留已存的值，
+     * '' = 明确清除，非空 = 写入）。只有 authUser 与 user 不同、且密码也不一样时
+     * 才需要。
+     */
+    authPassword?: string;
+    /**
+     * 认证方式覆盖，三态契约同上：undefined = 本卡片没提供（保留已存的 authKind 键），
+     * '' = 明确恢复「自动」（删掉该键，回到按 provider/主机派生），非空 = 钉住。
+     * 这是给仍能用应用密码连 Exchange Online 的租户（混合/本地部署、SMTP AUTH 未关）
+     * 留的退路，没有它，这类账号升级后只会看到「尚未登录」且无处可改。
+     */
+    authKind?: string;
     inboxFolder?: string;
     imap?: {
         host?: string;
@@ -65,6 +127,46 @@ export interface AccountCardInput {
         secure?: boolean;
     };
 }
+/**
+ * Verdict on the `Host` header: `undefined` to proceed, otherwise the reason to
+ * refuse.
+ *
+ * The localhost gate on `socket.remoteAddress` proves where the packets came
+ * from, not which name the browser believes it is talking to. A page the user
+ * visits can point a domain at 127.0.0.1 (DNS rebinding); that request looks
+ * same-origin to the browser, carries no `Origin`, and would make the snapshot
+ * readable — and the snapshot carries `accountsYaml`, plaintext 授权码 included.
+ * Requiring a localhost `Host` closes it.
+ *
+ * A request with no `Host` at all did not come from a browser (HTTP/1.0, curl,
+ * the test harness), and the remote-address gate still applies to it.
+ */
+export declare function hostVerdict(host: unknown): string | undefined;
+/**
+ * Verdict on a state-changing POST: `undefined` to proceed, otherwise the status
+ * and reason to refuse.
+ *
+ * Cross-origin writes are the hole the remote-address gate cannot see: a browser
+ * page may POST here as a「simple request」(text/plain, no preflight) and change
+ * settings or trigger a dial. Three independent checks close it:
+ *
+ * - `application/json` is not a simple-request content type, so a cross-origin
+ *   caller is forced into a preflight, which this route never answers with
+ *   `Access-Control-Allow-Origin`.
+ * - `Origin`, when it names an http(s) page, must be a localhost origin. Other
+ *   schemes are left to the next check: the host may load its UI through a
+ *   custom protocol, and a hostile page cannot produce one.
+ * - `Sec-Fetch-Site`, when present, must be `same-origin` (or `none`, a
+ *   user-initiated navigation with no referrer). This is what catches an opaque
+ *   `Origin: null` from a sandboxed iframe.
+ *
+ * Headers a non-browser client omits are not fabricatable by page script, so
+ * their absence is allowed rather than treated as a rejection.
+ */
+export declare function postVerdict(headers: Record<string, unknown>): {
+    status: number;
+    message: string;
+} | undefined;
 /**
  * Browser-facing backend: snapshot the settings namespace, save it with
  * optimistic concurrency, and test a draft account over a live IMAP login.
@@ -91,7 +193,6 @@ export declare class EmailSettingsBackend {
             error?: string | undefined;
             list: AccountCardData[];
             defaultAccount?: string | undefined;
-            raw: Record<string, unknown>;
         };
         presets: {
             custom: Record<string, ServerPreset>;
@@ -117,7 +218,6 @@ export declare class EmailSettingsBackend {
             error?: string | undefined;
             list: AccountCardData[];
             defaultAccount?: string | undefined;
-            raw: Record<string, unknown>;
         };
         presets: {
             custom: Record<string, ServerPreset>;

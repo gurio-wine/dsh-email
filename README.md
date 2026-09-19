@@ -24,7 +24,7 @@ IMAP/SMTP email tools for DeepSeek Harness, with replies, forwarding, mailbox or
 |---|---|
 | `email_list` | 列出文件夹里最新的邮件（未读过滤、分页、只看摘要不带正文） |
 | `email_read` | 按 uid 读取一封邮件的全文（HTML 邮件自动转纯文本，超长截断） |
-| `email_search` | 按关键词搜索主题/发件人/收件人/抄送（服务器端 subject/from/to/cc）；无结果时默认回退到最近 30 封的正文扫描（含 to/cc） |
+| `email_search` | 按关键词搜索主题/发件人/收件人/抄送（服务器端 subject/from/to/cc；命中会先用信封复核，QQ 这种"什么都匹配"的响应会被判无效）；复核或服务器都没给出可信结果时，默认回退到最近 30 封的正文扫描（含 to/cc） |
 | `email_send` | 代发邮件（支持带附件）。**默认发信前会弹确认**，显示收件人、主题和附件数，由你批准后才发出 |
 | `email_folders` | 列出邮箱的文件夹（INBOX/已发送/垃圾邮件/自定义…），拿 path 喂给其他工具 |
 | `email_attachment` | 按序号下载邮件附件（默认存到会话工作区，模型可直接读取；大小受 maxAttachmentBytes 限制） |
@@ -45,24 +45,16 @@ IMAP/SMTP email tools for DeepSeek Harness, with replies, forwarding, mailbox or
 
 ### 版本记录
 
-- **0.10.8-dev（未发布）**：设置页三处升级——①暗色主题收尾：修掉 0.10.8 引入的不存在边框变量（暗色下刺眼浅灰边框），面板全部样式引用官方 `--dsw-alias-*` 设计变量；②多账号可视化卡片编辑器：增删改/改名/设默认/按账号名单卡测试连接，半填账号不阻断，已存授权码留空即保持，YAML 直接编辑保留为逃生口（序列化尽量保留注释，无法保留时明确提示）；③服务器预设：新增 `serverPresets` 配置（自定义服务商端点，不含凭证），设置页可视化增删改，账号服务商下拉自动列出预设名并预填端点。序列化时非内置 provider 值不落 YAML（自定义预设按端点展开，避免解析报「provider 未知」）。测试 127 → 132 项。
-- **0.10.8（2026-09-16）**：合入 GUODnuli 的 [PR #9](https://github.com/STARDUSTLC666/dsh-email/pull/9)，将设置页及新邮件弹窗的文字、边框引用改为官方主题变量，修复深色主题文字不可读；复验官方 Harness 0.1.5-rc.2 和 0.1.6-alpha.1。
-- **0.10.7（2026-09-11）**：复验官方 Harness 0.1.5-rc.1，更新整套同载与真实服务验证记录；运行时代码未变。
-- **0.10.6（2026-09-10）**：修复单账号设置页授权码留空时，空字符串遮蔽 `DSH_EMAIL_PASSWORD`，导致“测试连接”和保存后工具调用报未配置的问题；显式密码仍优先，多账号不会借用该环境变量。更新设置页工具数量、多账号说明，并补充真实 QQ 邮箱验证结果。
-- **0.10.5（2026-09-08）**：补充官方 Harness 0.1.3-alpha.2 的安装、工具注册及 Web 设置接口验证，更新 Node 版本要求，明确 `email_health` 只检查配置；运行时代码与 0.10.4 相同。
-- **0.10.4（2026-09-07）**：将 `mailparser` 最低版本提升到 `3.9.22` 并更新锁文件，使用 `html-to-text 10.0.1 → deepmerge-ts 8.0.2` 的修复链处理 [CVE-2026-40345](https://github.com/RebeccaStevens/deepmerge-ts/security/advisories/GHSA-ggr8-5vv4-36mx)。不依赖插件作为下游依赖安装时不生效的根级 `pnpm.overrides`；新增真实依赖链与 HTML 邮件解析回归测试。依赖告警不等于已证实邮件输入可触发该漏洞。
-- **0.10.1**：补发制品——已发布的 0.10.0 打包时只含 `email_mark`，本版同时包含 `email_mark` 与 `email_reply`，代码与 0.10.0 的 main 一致。
-- **0.10.0**：新增 `email_mark`（已读/未读/星标/移动文件夹，补齐收发闭环的整理侧）与 `email_reply`（回复/回复全部/转发，自动线程头+引文，走发信审批门）；连接池按读/写模式分别管理邮箱打开状态。
-- **0.9.1**：修复设置页空主机遮蔽 provider 预设（#3/#6）；IMAP 连接超时不再杀死整个 DSH 进程（#4）；暗色模式输入控件可见（#2）；密码栏提示环境变量 `DSH_EMAIL_PASSWORD` 免明文方案（#5）。
-- **0.9.0**：新增 `email_watch` 增量新邮件检查工具（游标式，适合定时提醒）；Web 端新增「鲸鱼娘递信」新邮件弹窗（本地皮肤素材运行时读取 + 内置回退图）。
-- **0.8.2**：`since` / `until` 参数描述与其余参数统一为英文，方便多语言 agent 理解。
-- **0.8.0/0.8.1**：`email_list` / `email_search` 新增 `since` / `until` 日期范围过滤；新增 `email_health` 账号配置自检；适配 harness 0.1.2（清理已删除的客户端注入声明）。
-- **0.6.2**：服务器端搜索补齐 `cc`，搜索范围真正覆盖主题 / 发件人 / 收件人 / 抄送；正文回退扫描也匹配 `to` / `cc`，单封解析失败不中断整批；列表强制 UID 降序「最新在前」；`email_send` 附件参数严格校验。
-
-
+- **0.13.1（2026-09-19）**：内置一份社区公共客户端注册（感谢 [gurio-wine](https://github.com/gurio-wine)），Outlook / Exchange Online 的 OAuth2 登录开箱即用；想用自己的应用仍可填 `clientId` 覆盖，设置页会显示当前生效的是哪个应用。测试 264 项。
+- **0.13.0（2026-09-18）**：修复长正文截断成空、`email_watch` 永久漏报新邮件、附件缓存跨 UIDVALIDITY 失效；10 个工具声明超时；读信/搜索只下正文分段；搜索回退标明扫描口径。测试 262 项。
+- **0.12.0（2026-09-18）**：新增发送别名（`senderName` / `authUser` / `authPassword`）与 `email_search` 的 `offset` 翻页；修复 QQ 搜索假命中；弹窗轮询按页面可见性节流。
+- **0.11.0（2026-09-18）**：合入 gurio-wine 的设置页四连（卡片编辑器 / OAuth2 设备码登录 / 双语面板 / `authKind` 钉住），并修掉评审发现的 SMTP OAuth2、设置路由同源校验等问题。
+- **0.10.8 及更早**：见 [CHANGELOG.md](CHANGELOG.md)。
 ## 兼容性
 
-已在官方源码构建的 Harness `0.1.5-rc.2` 和 `0.1.6-alpha.1` 上验证（2026-09-16）：18 个组件与 ModLens 同载，工具 schema、技能注册及离线只读调用检查通过；Email 构建及 132 项测试通过。采用 `cordis.patch.yml` + `dsh.bundle.patch` 组合包模型。Node 要求为 22.19 及以上的 22.x，或 24 及以上。外部服务的实际业务操作需按各组件配置单独验证。
+2026-09-16 曾在官方源码构建的 Harness `0.1.5-rc.2` 和 `0.1.6-alpha.1` 上完成同载验证：18 个组件与 ModLens 同载，工具 schema、技能注册及离线只读调用检查通过。
+
+**0.11.0 的同载验证（2026-09-18，本地构建的 Harness `0.1.5-rc.2`，`web` profile）**：插件挂载无报错；设置路由 GET 返回 200 且响应中已无 `raw` 字段；用 `text/plain` 发 POST 被 **415** 拒绝（同源守卫在真实宿主下生效）；`application/json` 的 POST 下卡片投影正确，账号钉住 `authKind: password` 后 `authKindDeclared` 与 `authKind` 均为 `password`；设置面板实际渲染出账号卡片、8 个服务商预设的中文下拉、「认证方式」三态选择器、「应用（客户端）ID」输入格与提示、未填 ID 时的警示条（说明 `--dsw-alias-state-warn-primary` 在真实宿主下确有定义）与「登录 Microsoft 账号」按钮；浏览器控制台无报错；save 全链路可用，验证结束后已把 `accountsYaml` 还原为空、原有账号恢复。离线测试 231 项全绿。**仍未做**：真实 Outlook 租户的 OAuth2 端到端（设备码流程要真人在浏览器完成授权）与真实发信未测，`clientId` 相关路径目前只有假 authority 的用例覆盖。采用 `cordis.patch.yml` + `dsh.bundle.patch` 组合包模型。Node 要求为 22.19 及以上的 22.x，或 24 及以上。外部服务的实际业务操作需按各组件配置单独验证。
 
 2026-09-10，npm `dsh-email@0.10.6` 曾通过真实 QQ 邮箱目录、列表、读取和搜索，以及设置页“测试连接”“保存并应用”检查；授权码留空时能继续使用 `DSH_EMAIL_PASSWORD`。独立 SMTP 登录认证也已通过。此次复验未连接真实邮箱，未发送、修改或删除邮件。
 
@@ -80,12 +72,12 @@ dsh plugin --profile web add dsh-email
 
 **配置方式有两种（任选其一）：**
 
-1. **网页设置（推荐）**：重启后打开 **设置 → 邮件 (dsh-email)**，在账号卡片里填邮箱地址和授权码，点「保存并应用」；每张卡片还能单独「测试连接」。零 YAML、零重启。
-2. **YAML**：按下面的 cordis.patch.yml 模板手写；设置页的「多账号（高级，YAML）」文本框也能填账号映射（覆盖 YAML 里的 accounts），卡片与文本框互为逃生口。
+1. **网页设置（推荐）**：重启后打开 **设置 → 邮件 (dsh-email)**，在账号卡片里填邮箱地址和授权码——改动即自动保存，无需再点按钮；每张卡片还能单独「测试连接」。零 YAML、零重启。
+2. **YAML**：按下面的 cordis.patch.yml 模板手写 `accounts` 映射。设置页的 `accountsYaml` 由卡片编辑器写入（非空时覆盖 `accounts`），面板本身不再提供 YAML 原文文本框；卡片不建模的字段（如 `socketTimeoutMs`、`connectionTimeoutMs`）仍可在 YAML 里手写，保存卡片时会原地保留。认证方式（`authKind`）已在卡片上提供选择器，无需手写。
 
 设置页整体跟随 DSH 的深浅主题：面板样式全部引用官方 `--dsw-alias-*` 设计变量、不写死颜色，切换浅色/深色即时生效（0.10.8 曾引用一个并不存在的边框变量，暗色下会出现刺眼的浅灰边框，已修掉）。
 
-多账号可以在设置页可视化编辑：账号卡片支持增删改账号、改名、设默认、按账号名单独「测试连接」；没填完的账号不阻断保存，只标一个「未完成」。卡片的改动先落到 YAML 文本，再和整份表单一起「保存并应用」才算生效。保存卡片时，已存的授权码默认保持（密码栏留空 = 不变，填内容 = 覆盖）；YAML 里的注释尽量原地保留，实在保不住时会明确提示。
+多账号可以在设置页可视化编辑：账号卡片支持增删改账号、改名、设默认、按账号名单独「测试连接」；没填完的账号不阻断保存，只标一个「未完成」。卡片改动即时防抖落盘，不再有"先写 YAML 文本、再点一次保存"这一步；版本冲突（别处也改了设置）会自动重基后重存一次，而不是拿旧版本号反复失败。保存卡片时，已存的授权码默认保持（密码栏留空 = 不变，填内容 = 覆盖）；YAML 里的注释尽量原地保留，实在保不住时会明确提示。改名走的是原地改键，授权码与高级键一并保留，且不允许改成已有账号名（那会顶掉另一个账号）。账号自己手写的 imap/smtp 端点只在**服务商真的换了**时才清洗——运行时以账号自己的 host 优先，普通保存不会悄悄改动连接目标。
 
 设置页保存的值存在 `settings.yaml` 的 `dsh-email` 命名空间里，覆盖 YAML 的默认账号配置。授权码字段标记为 secret，但填写后保存仍会写入本机配置文件。单账号如需避免保存授权码，可设置 `DSH_EMAIL_PASSWORD` 并将授权码栏留空；环境变量不会被复制进设置文件。
 
@@ -170,13 +162,18 @@ dsh plugin --profile web remove dsh-email
 | `provider` | 无 | 预设名，自动填 imap/smtp 地址；显式写的 host/port/secure 优先 |
 | `user` | 必填 | 登录邮箱地址 |
 | `password` | 必填* | 授权码/应用专用密码；*也可用环境变量 `DSH_EMAIL_PASSWORD` |
+| `senderName` | 无 | 发件显示名：只改收件人看到的名称，发件地址仍是 `user` |
+| `authUser` | = `user` | 登录账号。别名 / SMTP 中继场景：`user` 是发件地址，这里填真正用于 IMAP/SMTP 认证的账号 |
+| `authPassword` | = `password` | `authUser` 对应的密码；只有登录账号与 `user` 不同、且密码也不一样时才需要 |
 | `imap.host/port/secure` | 按预设 | 收信服务器（另有 connectionTimeoutMs/socketTimeoutMs 可调超时） |
 | `smtp.host/port/secure` | 按预设 | 发信服务器 |
 | `inboxFolder` | `INBOX` | 收发工具默认使用的文件夹 |
 | `sendApproval` | `true` | 发信前弹确认（强烈建议保留） |
 | `maxBodyChars` | `20000` | email_read 正文截断上限（1000–200000） |
 | `accounts` | 无 | 具名账号表；账号级字段覆盖顶层简写 |
-| `accountsYaml` | 无 | 设置页「多账号（高级）」文本框的 YAML 文本；非空时覆盖 accounts |
+| `accountsYaml` | 无 | 账号映射的 YAML 文本，由设置页的卡片编辑器写入；非空时覆盖 accounts |
+| `clientId` | 内置社区应用（见下） | OAuth2 账号的应用（客户端）ID：留空即用插件内置的公共客户端，填了则覆盖内置值（账号级也可覆盖顶层简写） |
+| `authKind` | 按 provider 派生 | 认证方式覆盖，取值 `oauth2` / `password`。缺省时按 provider 与 IMAP 主机派生；仍能用应用密码连 Exchange Online 的混合或本地租户可钉 `password`。设置页卡片的「认证方式」选择器即写此键 |
 | `serverPresets` | 无 | 自定义服务商预设的 YAML 文本（键=预设名，值含 `label?`/`imap`/`smtp`）；只存端点、不含凭证，设置页下拉会列出预设名并把端点预填进账号卡片，改预设不会重连已建立的连接 |
 | `defaultAccount` | 单账号时自动 | 工具省略 account 参数时使用的账号（多账号必填） |
 | `downloadDir` | 会话工作区下 .dsh-email-downloads（回退 $DSH_HOME/email-downloads） | email_attachment 的落盘目录；显式设置后固定 |
@@ -201,12 +198,39 @@ dsh plugin --profile web remove dsh-email
 - 会话处于 **Full Access（完全访问）** 模式时，harness 的审批策略是 never（不弹任何确认框）——`email_send` 会**被拦截并给出明确提示**。两条出路：① 把访问模式切回 Read Only / Write；② 关闭 `sendApproval`（设置页勾掉「发信前确认」），即显式声明自行承担风险。
 - 本插件不做任何联网上报，凭证只在内存中用于连接你的邮箱服务器。
 
+## Outlook OAuth2（设备码登录）
+
+微软已经对 Exchange Online 关闭了用户名+密码的 basic auth：个人 outlook.com 与绝大多数租户现在只能用 OAuth2。本插件支持设备码（device code）流程，IMAP 与 SMTP 双端共用同一份 token，过期自动刷新。
+
+**内置的应用 ID 是哪来的**：设备码登录必须先有一个"应用注册"，而让每个用户自己注册一次实在太麻烦——所以插件内置了一份：`15dcd5aa-00dd-487f-82d7-1d2b2c299e14`，由贡献者 [gurio-wine](https://github.com/gurio-wine) 在 [PR #13](https://github.com/STARDUSTLC666/dsh-email/pull/13) 注册，并授权本项目内置使用，在此致谢。代价也要说清楚：微软同意屏上显示的是**他的应用名**（企业安全团队可能因此拒绝授权），登录日志与 telemetry 会归到**他的租户**（含你的 UPN）；哪天他删掉这个应用，所有没填自己 ID 的账号会同时登不上，报错还只是一句"clientId 可能填错了"。**想完全自主就注册一个自己的（免费，约 10 分钟）填进卡片覆盖内置值；留空则一直用内置的。**
+
+**换成自己的应用（可选，免费，约 10 分钟）**：
+
+1. 打开 [Entra 管理中心](https://entra.microsoft.com/) → **应用注册（App registrations）** → **新注册**。
+2. **受支持的账户类型**选「任何组织目录中的账户 **以及** 个人 Microsoft 账户」——这一项决定了个人 outlook.com 能不能登录，选错会报 `AADSTS700016` 或 `AADSTS50020`。
+3. **重定向 URI** 留空（设备码流程不需要）。点注册。
+4. 在概览页复制 **应用程序(客户端) ID**，这就是要填的 `clientId`。
+5. 左侧 **身份验证** → 页面最下方 **允许公共客户端流** 设为 **是** 并保存。不开这一项，登录会报 `AADSTS700028` 之类的"未开启设备码流"错误。
+6. 左侧 **API 权限** → 添加权限 → Microsoft Graph → **委托的权限**，勾上 `IMAP.AccessAsUser.All`、`SMTP.Send`、`offline_access`（最后这个是拿到 refresh token 的关键，少了它每次过期都要重新登录）。个人租户一般无需管理员同意；企业租户可能需要管理员点一次「授予同意」。
+
+**填进插件（覆盖内置值）**：设置页 → 邮件 (dsh-email) → 该账号卡片的「应用（客户端）ID」栏（卡片会显示当前生效的是哪个应用；留空即继续用内置的社区应用）；或者写在 YAML 里（账号级 `clientId`，也可写在顶层作为所有账号的默认）。
+
+**登录**：卡片上点「登录 Microsoft 账号」→ 面板给出一个 `microsoft.com/devicelogin` 链接和一段代码 → 在浏览器打开链接、输入代码、完成授权 → 面板轮询到成功后即显示「已登录：你的地址」。之后收信与发信都用这份 token。
+
+**注意事项**：
+
+- 企业租户可能还需要管理员在 Exchange 管理中心开启该邮箱的 **IMAP** 与 **SMTP AUTH**。没开 SMTP AUTH 时的典型症状是：收信一切正常，发信被拒。
+- token 与签发它的应用 ID 绑定：换了 `clientId` 会被判为"换了应用"，需要重新登录（这是有意的，避免拿旧应用的凭据去撞新应用）。内置应用是所有没填 `clientId` 的账号共用的一份：将来某个版本把它换成项目自己的注册时，这些账号也会需要重新登录一次。
+- 如果你的租户是混合或本地部署、SMTP AUTH 仍然开着，用应用密码也能连：在卡片的「认证方式」里选「密码 / 授权码」即可，不必走 OAuth2。
+
 ## 已知限制
 
-- **不支持 OAuth2**：强制 OAuth 的企业环境（部分 M365 / Google Workspace）暂不可用，只能使用邮箱服务商的应用专用密码 / 授权码。
+- **OAuth2 仅覆盖 Outlook / Exchange Online（开箱即用，也可自带应用 ID）**：设备码登录已支持 IMAP 与 SMTP 双端，默认使用插件内置的社区应用（见上文「Outlook OAuth2」），无需自己注册即可登录；企业策略不接受第三方应用时，在卡片里填自己的 `clientId` 覆盖。Google Workspace 等其它强制 OAuth 的环境仍不可用，只能用服务商的应用专用密码 / 授权码。
+- **搜索的匹配数**：服务器命中会先用信封复核（见上文 `email_search`）；复核通过时「共 N 条匹配」沿用服务器给出的条数，而列出的每一行都保证真的带关键词。正文回退扫描只看了最近 `bodySearchLimit` 封，不知道全文件夹匹配数，因此渲染为「本页 N 条（仅扫描最近 N 封）」而不是「共 N 条」。
 - **正文搜索**：服务器端只搜 subject / from / to / cc；多数服务器（如 QQ）的 IMAP `TEXT` / `HEADER` 搜索不可靠，无结果时回退到最近 `bodySearchLimit` 封的正文扫描（较慢，可用 `bodySearchFallback` 关闭）。
 - **附件**：内嵌图片暂不支持单独下载；附件定位失败会直接报错而不是下载错误文件（安全默认）。
 - **密码落盘**：设置页保存的授权码以明文写在本机 `settings.yaml`（secret 标记只保证它不进日志 / 导出 / 诊断，不做磁盘加密）。请勿把 `settings.yaml` 交给不信任的人。
+- **OAuth2 token 落盘**：access / refresh token 以明文 JSON 存在 `$DSH_HOME/data/dsh-email/oauth2-tokens.json`（刻意不放进 `settings.yaml`，因此不会随设置导出）。写入时带了 `mode: 0o600`，但这个权限位只在**文件创建那一刻**生效，且**在 Windows 上等于无效**——请勿把该文件交给不信任的人。token 与签发它的应用 ID 绑定，换了 `clientId` 需要重新登录；删除账号会清理它的 token。
 - **本地改动会被 `pnpm install` 还原**：如果你是直接改 `node_modules/dsh-email/` 里的文件做本地部署，任何一次 `pnpm install` 都会把它还原成 registry 上的版本（例如 0.10.7）；要长期保留请改成从本地路径或 Git 提交安装。
 
 ## 开发

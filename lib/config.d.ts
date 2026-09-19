@@ -18,9 +18,25 @@ export declare const OUTLOOK_PROVIDER = "outlook";
 /** The Exchange Online IMAP host. Any account dialling it is an OAuth2 account. */
 export declare const OUTLOOK_IMAP_HOST = "outlook.office365.com";
 /**
- * The client id of the public application this plugin uses for the device-code
- * flow. A well-known multi-tenant registration with the IMAP/SMTP delegated
- * permissions; an account may override it with its own `clientId`.
+ * The built-in client id for the device-code flow: a community registration.
+ *
+ * Requiring every Outlook user to register an application of their own puts a
+ * setup wall in front of the one provider where OAuth2 cannot be avoided, so
+ * the plugin ships one. The id below is the public-client registration
+ * contributed by gurio-wine (PR #13) and used with their permission; the README
+ * credits them and states the two things that follow from using somebody
+ * else's application: the consent screen names *their* app, and the sign-in
+ * logs land in *their* tenant along with the user's UPN.
+ *
+ * An account that wants neither — an enterprise that refuses third-party apps,
+ * or a day when this registration is gone — sets its own `clientId` (a free
+ * Entra public-client registration) and that value wins over this constant.
+ * The settings card shows which application is in effect either way, so nobody
+ * consents to an app they were not told about.
+ *
+ * Replacing this constant is the whole change a maintainer makes to ship the
+ * project's own application instead. Tokens are bound to the id that issued
+ * them, so such a release asks every built-in account to log in one more time.
  */
 export declare const OUTLOOK_OAUTH2_CLIENT_ID = "15dcd5aa-00dd-487f-82d7-1d2b2c299e14";
 /**
@@ -47,10 +63,34 @@ export interface AccountConfig {
     user?: string;
     password?: string;
     /**
+     * Display name for the From header. The address stays `user` — recipients
+     * must see the mailbox that owns the mail, not the login.
+     */
+    senderName?: string;
+    /**
+     * Login handed to IMAP/SMTP when it differs from `user`: the alias case,
+     * where `user` is the address mail is sent *from* and the server only
+     * authenticates the real account, or a relay whose login is not a mailbox
+     * at all. Defaults to `user`.
+     */
+    authUser?: string;
+    /** Password that goes with `authUser`. Defaults to `password`. */
+    authPassword?: string;
+    /**
      * Public-client id used by the OAuth2 device-code flow. Only read for an
      * OAuth2 account, where it overrides OUTLOOK_OAUTH2_CLIENT_ID.
      */
     clientId?: string;
+    /**
+     * Escape hatch over the derived authentication scheme. Left unset, an account
+     * pointed at the `outlook` provider or the Exchange Online IMAP host is an
+     * OAuth2 account and its password is dropped. Set `password` to keep using an
+     * app password there — a tenant that still accepts basic auth (hybrid or
+     * on-prem, SMTP AUTH left enabled), or a mailbox that worked before this
+     * derivation existed, must not be told「尚未登录」after an upgrade. Set
+     * `oauth2` to opt in from a custom host.
+     */
+    authKind?: AuthKind;
     imap?: ImapConfig;
     smtp?: SmtpConfig;
     inboxFolder?: string;
@@ -119,12 +159,21 @@ export declare const EMAIL_PASSWORD_ENV = "DSH_EMAIL_PASSWORD";
 /** Fully resolved, validated configuration for one account. */
 export interface ResolvedEmailConfig {
     user: string;
+    /** Display name for the From header, '' when the account does not set one. */
+    senderName: string;
+    /** Login actually handed to IMAP/SMTP (== user unless authUser is set). */
+    authUser: string;
+    /** Password for authUser (== password unless authPassword is set). */
+    authPassword: string;
     /**
      * The app password / 授权码. Empty for an OAuth2 account — that is the point:
      * nothing is stored, the token store holds the credential instead.
      */
     password: string;
-    /** How this account authenticates. Chosen by `provider`, never by the user directly. */
+    /**
+     * How this account authenticates. Derived from `provider` / the IMAP host
+     * unless the account pins it with an explicit `authKind`.
+     */
     authKind: AuthKind;
     /** Public-client id for the device-code flow (OAuth2 accounts only). */
     clientId?: string;

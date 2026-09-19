@@ -232,11 +232,24 @@ export function renderRead(value: EmailReadResult): TextBlock[] {
 }
 
 export function renderSearch(value: EmailSearchResult): TextBlock[] {
+  const scanned = value.countKind === 'scanned'
+  // 回退扫描只看了最近 scannedLimit 封，不知道全文件夹匹配数：不能把本页条数说成「共 N 条」。
+  const scannedNote = '仅扫描最近 ' + (value.scannedLimit ?? 0) + ' 封，未统计全文件夹匹配数'
   if (value.messages.length === 0) {
+    if (scanned) {
+      return oneText('账号 ' + value.account + '，在文件夹 "' + value.folder + '" 中搜索 "' + value.query + '"：本页没有匹配（' + scannedNote + '）。')
+    }
     return oneText('账号 ' + value.account + '，在文件夹 "' + value.folder + '" 中搜索 "' + value.query + '"：共 ' + value.count + ' 条匹配，本次没有列出。')
   }
   const lines = value.messages.map((m, i) => '#' + (i + 1) + ' ' + describeMessage(m))
-  return oneText('账号 ' + value.account + '，在文件夹 "' + value.folder + '" 中搜索 "' + value.query + '"：共 ' + value.count + ' 条匹配，展示最新 ' + value.messages.length + ' 条：\n\n' + lines.join('\n'))
+  const offset = value.offset ?? 0
+  const window = offset > 0
+    ? '跳过最新 ' + offset + ' 条后展示 ' + value.messages.length + ' 条'
+    : '展示最新 ' + value.messages.length + ' 条'
+  const summary = scanned
+    ? '本页 ' + value.messages.length + ' 条（' + scannedNote + '）' + (offset > 0 ? '，已被 offset 跳过最新 ' + offset + ' 条' : '')
+    : '共 ' + value.count + ' 条匹配，' + window
+  return oneText('账号 ' + value.account + '，在文件夹 "' + value.folder + '" 中搜索 "' + value.query + '"：' + summary + '：\n\n' + lines.join('\n'))
 }
 
 export function renderSend(value: EmailSendResult): TextBlock[] {
@@ -270,6 +283,9 @@ export function renderReply(value: EmailReplyResult): TextBlock[] {
 }
 
 export function renderWatch(value: EmailWatchResult): TextBlock[] {
+  if (value.reset === true) {
+    return oneText('账号 ' + value.account + '：文件夹 "' + value.folder + '" 的 UIDVALIDITY 已变化（服务器重新编号了邮件），已重新建立基线（当前未读 ' + value.totalUnread + ' 封）。这次不报告新邮件，之后照常。')
+  }
   if (value.firstRun) {
     return oneText('账号 ' + value.account + '：已建立新邮件监视基线（当前未读 ' + value.totalUnread + ' 封）。之后调用 email_watch 只会报告新到的邮件。')
   }
@@ -313,6 +329,7 @@ export const watchSchema = {
     account: { type: 'string' },
     folder: { type: 'string' },
     firstRun: { type: 'boolean' },
+    reset: { type: 'boolean' },
     newCount: { type: 'integer' },
     totalUnread: { type: 'integer' },
     messages: { type: 'array', items: { type: 'object', properties: messageShape, additionalProperties: true } },
@@ -324,7 +341,7 @@ export const descriptions = {
   "email_list": 'List recent emails in a mailbox folder (newest first). Returns uid, date, sender, subject and flags without message bodies; use email_read with a uid to fetch the full text. Optional since/until (dates like 2026-08-01) filter by received date.',
   "email_read": 'Read one full email message by its uid (from email_list or email_search). Returns the plain-text body (HTML mail is converted; oversized bodies are truncated) plus attachment metadata; use email_attachment to download one.',
   "email_mark": 'Change an existing message: mark it read/unread, star/unstar it, or move it to another folder. Use after email_list/email_search when the user wants to tidy the mailbox (archive, clear unread, flag important mail). Moving uses the server MOVE/COPY so the uid changes; the new uid is reported when the server provides it.',
-  "email_search": 'Search emails by a keyword. The server first searches sender, recipients and subject; when that finds nothing and bodySearchFallback is enabled, recent messages are scanned locally including their body. since/until still constrain both paths. Returns the same compact rows as email_list.',
+  "email_search": 'Search emails by a keyword. The server first searches sender, recipients and subject; those hits are re-verified against the envelopes and, when none of them really carries the keyword (some servers answer every search with the same uids), recent messages are scanned locally including their body while bodySearchFallback is enabled. offset skips the newest matches for paging; since/until still constrain both paths. Returns the same compact rows as email_list.',
   "email_send": 'Send an email from a configured account, optionally with file attachments (absolute paths, or relative to the dsh process cwd). Sending asks the user for approval (recipient, subject and attachment count are shown) unless sendApproval is disabled; in Full Access mode the approval policy never asks, so the send is refused with an explanation instead. Never invent recipients or content without the user\'s instruction.',
   "email_reply": 'Reply to, reply-all to, or forward an existing message (mode: reply | reply-all | forward). Recipients come from the original message (your own address is excluded automatically), the subject gets a single Re:/Fwd: prefix, the original text is quoted underneath, and In-Reply-To/References headers keep mail clients threading correctly. mode=forward needs the to parameter. Like email_send, this asks the user for approval before sending. Never invent recipients or content without the user\'s instruction.',
   "email_folders": 'List the mailbox folders of an account (INBOX, Sent, Trash, custom folders, ...). Use the returned path values as the folder argument of the other email tools.',
@@ -359,6 +376,7 @@ export const parameters = {
     query: { type: 'string', required: true, description: 'Keyword to search for' },
     folder: { type: 'string', description: 'IMAP folder to search in; defaults to the account inboxFolder' },
     limit: { type: 'integer', description: 'How many matches to return, 1-100, default 10' },
+    offset: { type: 'integer', description: 'Skip this many newest matches first, default 0' },
     since: { type: 'string', description: 'Only search messages received on or after this date, e.g. 2026-08-01 (optional)' },
     until: { type: 'string', description: 'Only search messages received on or before this date, e.g. 2026-08-26 (optional)' },
     account: { type: 'string', description: ACCOUNT_HINT },

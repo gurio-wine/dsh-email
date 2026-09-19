@@ -1,11 +1,12 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply, EmailPool, SETTINGS_ROUTE } from '../lib/index.js'
-import { parseAccountsYaml, parseServerPresets, PROVIDER_NAMES, PROVIDER_PRESETS, resolveEmailSettings, serializeAccountsYaml } from '../lib/config.js'
+import { OUTLOOK_OAUTH2_CLIENT_ID, parseAccountsYaml, parseServerPresets, PROVIDER_NAMES, PROVIDER_PRESETS, resolveEmailSettings, serializeAccountsYaml } from '../lib/config.js'
 import { oauth2TokenFile, readTokenStore, writeTokenStore } from '../lib/oauth2.js'
+import { hostVerdict, postVerdict } from '../lib/web.js'
 
 const BASE = {
   provider: 'qq',
@@ -75,10 +76,19 @@ function mount(t, options = {}) {
   const route = routes.find(candidate => candidate.path === SETTINGS_ROUTE)
   assert.ok(route, 'the settings route must be mounted')
 
-  const call = async (payload, { method = 'POST', remoteAddress = '127.0.0.1' } = {}) => {
+  const call = async (payload, { method = 'POST', remoteAddress = '127.0.0.1', headers } = {}) => {
     const req = {
       method,
       socket: { remoteAddress },
+      // What the settings panel actually sends: a same-origin JSON POST. Cases
+      // that probe the Host/Origin/Content-Type guards override one header.
+      headers: {
+        host: '127.0.0.1:3080',
+        'content-type': 'application/json',
+        origin: 'http://127.0.0.1:3080',
+        'sec-fetch-site': 'same-origin',
+        ...headers,
+      },
       async *[Symbol.asyncIterator]() {
         if (payload !== undefined) yield Buffer.from(JSON.stringify(payload))
       },
@@ -132,10 +142,23 @@ test('snapshot carries accountsDetail (raw/list/defaultAccount) and the 8 builti
   // exactly the field that still describes the draft — that is its purpose.
   assert.deepEqual(value.accounts, [])
 
-  // accountsDetail.raw keeps every key, comments and all.
-  assert.deepEqual(Object.keys(value.accountsDetail.raw).sort(), ['home', 'work'])
-  assert.equal(value.accountsDetail.raw.work.user, 'w@qq.com')
-  assert.equal(value.accountsDetail.raw.work.password, 'pw')
+  // The draft is described by the cards, which project `hasPassword` instead of
+  // the secret. There is deliberately no `raw` field: it would hand the parsed
+  // mapping — plaintext 授权码 included — to the browser for nothing, since the
+  // editor only ever reads list/defaultAccount/error.
+  assert.deepEqual(value.accountsDetail.list.map(card => card.name).sort(), ['home', 'work'])
+  const workCard = value.accountsDetail.list.find(card => card.name === 'work')
+  assert.equal(workCard.user, 'w@qq.com')
+  assert.equal(workCard.hasPassword, true)
+  assert.equal('raw' in value.accountsDetail, false, 'the parsed mapping must not be echoed as a second copy of the secrets')
+  // The cards are the only account projection the editor consumes, and they
+  // carry `hasPassword` rather than the value. (settings.value.accountsYaml does
+  // carry plaintext by design — the advanced editor edits that text, and the key
+  // is declared secret in the settings schema.)
+  for (const card of value.accountsDetail.list) {
+    assert.equal('password' in card, false, `card ${card.name} must not carry a password value`)
+    assert.equal(typeof card.hasPassword, 'boolean')
+  }
 
   // A resolvable draft populates both fields consistently.
   const resolvable = mount(t, {
@@ -218,7 +241,7 @@ test('snapshot: an unknown provider degrades one card, never the list', async t 
   assert.equal(home.hasPassword, false)
 })
 
-test('snapshot: the card endpoints come from the preset, never from the account raw', async t => {
+test('snapshot: the card endpoints follow what actually connects (account overrides preset)', async t => {
   const yaml = [
     'work:',
     '  provider: qq',
@@ -230,17 +253,24 @@ test('snapshot: the card endpoints come from the preset, never from the account 
     '',
   ].join('\n')
   const { get } = mount(t, { value: { accountsYaml: yaml } })
-  const detail = (await get()).body.value.accountsDetail
+  const value = (await get()).body.value
+  const detail = value.accountsDetail
   const work = detail.list[0]
-  // An account stores a provider id: a stale hand-written endpoint must not
-  // show up in the editor as if it still drove the connection.
-  assert.equal(work.imap.host, 'imap.qq.com', 'the preset decides, not the stored copy')
-  assert.equal(work.smtp.host, 'smtp.qq.com')
+  // Runtime resolution is `acc.imap?.host ?? common.imap?.host ?? preset.imap.host`
+  // (src/config.ts), so a hand-written host is what actually connects. The card
+  // has to show that host: showing the preset's instead would display an address
+  // the plugin never dials, and saving would silently rewrite a working
+  // self-hosted config into the preset's endpoints.
+  assert.equal(work.imap.host, 'imap.corp.example', 'the host the account itself declares drives the connection')
+  assert.equal(work.smtp.host, 'smtp.corp.example')
+  // Fields the account does not override still come from the preset.
   assert.equal(work.imap.port, 993)
   assert.equal(work.smtp.port, 465)
-  // raw is the untouched mapping: the advanced key survives verbatim.
-  assert.equal(detail.raw.work.imap.socketTimeoutMs, 9000)
-  assert.equal(detail.raw.work.imap.host, 'imap.corp.example', 'raw is what the advanced editor edits')
+  // The advanced key lives on in the YAML the advanced editor edits; the card
+  // projection stays at the three connection fields and is not a second copy of
+  // the account mapping.
+  assert.match(value.settings.value.accountsYaml, /socketTimeoutMs: 9000/)
+  assert.equal('socketTimeoutMs' in work.imap, false, 'a card carries host/port/secure only')
 })
 
 // --- parseAccounts ----------------------------------------------------------
@@ -254,20 +284,23 @@ test('parseAccounts: valid YAML returns ok + list, and never 500s', async t => {
   assert.equal(body.value.ok, true)
   assert.equal(body.value.error, undefined)
   assert.equal(body.value.defaultAccount, 'work')
-  assert.equal(body.value.raw.work.password, 'pw')
+  // No `raw`: the parsed mapping carries the plaintext 授权码, and the editor
+  // only consumes the cards, which project `hasPassword` instead of the value.
+  assert.equal('raw' in body.value, false, 'parseAccounts must not echo the parsed mapping')
   assert.equal(body.value.list.length, 1)
+  assert.equal(body.value.list[0].hasPassword, true)
+  assert.equal('password' in body.value.list[0], false)
   assert.equal(body.value.list[0].isDefault, true)
   assert.equal(body.value.list[0].imap.host, 'imap.qq.com')
 })
 
-test('parseAccounts: invalid YAML returns 200 with ok:false, a Chinese error and raw {}', async t => {
+test('parseAccounts: invalid YAML returns 200 with ok:false, a Chinese error and an empty list', async t => {
   const { post } = mount(t)
   const { status, body } = await post({ action: 'parseAccounts', value: { accountsYaml: 'work: [unclosed' } })
   assert.equal(status, 200, 'a half-typed draft is a normal state, not an HTTP error')
   assert.equal(body.ok, true)
   assert.equal(body.value.ok, false)
   assert.match(body.value.error, /不是合法的 YAML/)
-  assert.deepEqual(body.value.raw, {})
   assert.deepEqual(body.value.list, [])
 })
 
@@ -277,7 +310,6 @@ test('parseAccounts: a non-object document is reported, not thrown', async t => 
   assert.equal(status, 200)
   assert.equal(body.value.ok, false)
   assert.match(body.value.error, /对象映射/)
-  assert.deepEqual(body.value.raw, {})
 })
 
 test('parseAccounts: a half-filled account still appears in the list', async t => {
@@ -304,7 +336,6 @@ test('parseAccounts: blank text is an empty draft, not a syntax error', async t 
     assert.equal(status, 200)
     assert.equal(body.value.ok, true, `blank input ${JSON.stringify(text)} must not be an error`)
     assert.equal(body.value.error, undefined)
-    assert.deepEqual(body.value.raw, {})
     assert.deepEqual(body.value.list, [])
   }
 })
@@ -356,7 +387,7 @@ test('serializeAccounts keeps comments (the step-1 writer cannot)', async t => {
   assert.equal(parsed.defaultAccount, 'work')
 })
 
-test('serializeAccounts: a custom account writes no provider key; unknown keys survive', async t => {
+test('serializeAccounts: a custom account writes no provider key; stored endpoints and unknown keys survive', async t => {
   const { post } = mount(t)
   const source = 'work:\n  user: w@x.y\n  imap:\n    socketTimeoutMs: 9000\n    host: imap.old\n'
   const { body } = await post({
@@ -374,12 +405,17 @@ test('serializeAccounts: a custom account writes no provider key; unknown keys s
   const out = body.value.accountsYaml
   assert.equal(/provider/.test(out), false, 'provider "" would resolve as 「provider "" 未知」')
   assert.match(out, /socketTimeoutMs: 9000/, 'an advanced key must survive in place')
-  assert.equal(/host: imap\.new|host: imap\.old/.test(out), false, 'endpoints are never stored on an account')
+  // A provider-less account has nothing but its stored endpoints to connect
+  // with, and the provider did not change, so they are not stale and stay put.
+  // The card never writes endpoints (they are edited through presets or the raw
+  // YAML), so the posted imap.new is dropped rather than stored.
+  assert.match(out, /host: imap\.old/, 'the endpoint that drives the connection survives')
+  assert.equal(/imap\.new/.test(out), false, 'a card does not write endpoints')
   const parsed = parseAccountsYaml(out)
   assert.equal('provider' in parsed.map.work, false)
   assert.equal(parsed.map.work.imap.socketTimeoutMs, 9000)
-  assert.equal('host' in parsed.map.work.imap, false)
-  assert.equal('port' in parsed.map.work.imap, false)
+  assert.equal(parsed.map.work.imap.host, 'imap.old')
+  assert.equal('port' in parsed.map.work.imap, false, 'fields the account never declared are still not invented')
   assert.equal('secure' in parsed.map.work.imap, false)
 })
 
@@ -865,6 +901,84 @@ test('the new actions stay localhost-only like the rest of the route', async t =
   assert.equal(status, 403)
 })
 
+test('a cross-origin simple request cannot write settings', async t => {
+  const { call } = mount(t)
+  // text/plain is a「simple request」content type: a page the user visits can
+  // POST it here with no preflight, which is exactly why it is refused.
+  const simple = await call({ action: 'save', value: BASE }, {
+    headers: { 'content-type': 'text/plain;charset=UTF-8', origin: 'https://evil.example', 'sec-fetch-site': 'cross-site' },
+  })
+  assert.equal(simple.status, 415)
+  assert.equal(simple.body.error.code, 'unsupported-media-type')
+})
+
+test('a foreign Origin on a JSON POST is refused', async t => {
+  const { call } = mount(t)
+  const { status, body } = await call({ action: 'parseAccounts', value: { accountsYaml: '' } }, {
+    headers: { origin: 'https://evil.example' },
+  })
+  assert.equal(status, 403)
+  assert.equal(body.error.code, 'forbidden')
+  assert.match(body.error.message, /evil\.example/)
+})
+
+test('Sec-Fetch-Site catches an opaque Origin, and same-origin is let through', async t => {
+  const { call } = mount(t)
+  // A sandboxed iframe sends `Origin: null`; the site header is what names it.
+  const sandboxed = await call({ action: 'parseAccounts', value: { accountsYaml: '' } }, {
+    headers: { origin: 'null', 'sec-fetch-site': 'cross-site' },
+  })
+  assert.equal(sandboxed.status, 403)
+
+  const sameOrigin = await call({ action: 'parseAccounts', value: { accountsYaml: 'a: { user: a@x.y }\n' } })
+  assert.equal(sameOrigin.status, 200)
+  assert.equal(sameOrigin.body.ok, true)
+})
+
+test('a rebound Host cannot read the snapshot, whatever the method', async t => {
+  const { call } = mount(t)
+  // The socket is still 127.0.0.1 — that is the whole point of rebinding — but
+  // the name the browser used is not ours, and the snapshot carries accountsYaml
+  // with the plaintext 授权码 in it.
+  const get = await call(undefined, { method: 'GET', headers: { host: 'attacker.example' } })
+  assert.equal(get.status, 403)
+  assert.match(get.body.error.message, /attacker\.example/)
+  const post = await call({ action: 'parseAccounts', value: { accountsYaml: '' } }, { headers: { host: 'attacker.example' } })
+  assert.equal(post.status, 403)
+})
+
+test('a non-browser client on localhost still works, and localhost Hosts pass', async t => {
+  const { call } = mount(t)
+  // No Origin, no Sec-Fetch-Site: a script or curl on the same machine. Page
+  // script cannot omit these headers, so this stays open.
+  const scripted = await call({ action: 'parseAccounts', value: { accountsYaml: 'a: { user: a@x.y }\n' } }, {
+    headers: { host: undefined, origin: undefined, 'sec-fetch-site': undefined },
+  })
+  assert.equal(scripted.status, 200)
+  for (const host of ['localhost:3080', '127.0.0.1:3080', '[::1]:3080']) {
+    const { status } = await call({ action: 'parseAccounts', value: { accountsYaml: '' } }, { headers: { host } })
+    assert.equal(status, 200, `Host ${host} is a legitimate way to reach the panel`)
+  }
+})
+
+test('hostVerdict and postVerdict: the guard rules on their own', () => {
+  assert.equal(hostVerdict(undefined), undefined, 'no Host header is not a browser request')
+  assert.equal(hostVerdict('localhost:3080'), undefined)
+  assert.equal(hostVerdict('[::1]:3080'), undefined)
+  assert.match(hostVerdict('attacker.example') ?? '', /not a localhost name/)
+
+  assert.equal(postVerdict({ 'content-type': 'application/json' }), undefined, 'json with no browser headers passes')
+  assert.equal(postVerdict({ 'content-type': 'application/json; charset=utf-8', origin: 'http://localhost:3080', 'sec-fetch-site': 'same-origin' }), undefined)
+  assert.equal(postVerdict({ 'content-type': 'application/json', origin: 'app://dsh', 'sec-fetch-site': 'same-origin' }), undefined,
+    'the host may load its UI through a custom protocol')
+  assert.equal(postVerdict({}).status, 415, 'a missing content type is not a panel request')
+  assert.equal(postVerdict({ 'content-type': 'application/x-www-form-urlencoded' }).status, 415)
+  assert.equal(postVerdict({ 'content-type': 'application/json', origin: 'https://evil.example' }).status, 403)
+  assert.equal(postVerdict({ 'content-type': 'application/json', 'sec-fetch-site': 'same-site' }).status, 403)
+  assert.equal(postVerdict({ 'content-type': 'application/json', 'sec-fetch-site': 'none' }), undefined,
+    'a user-initiated navigation carries no referrer')
+})
+
 test('snapshot never leaks a password through the card list', async t => {
   const yaml = 'work: { provider: qq, user: w@qq.com, password: super-secret }\n'
   const { get } = mount(t, { value: { accountsYaml: yaml } })
@@ -888,7 +1002,16 @@ test('parseAccounts and serializeAccounts agree with the step-1 config helpers',
   const { post } = mount(t)
   const yaml = 'work: { provider: qq, user: w@qq.com, password: pw }\n'
   const parsed = await post({ action: 'parseAccounts', value: { accountsYaml: yaml } })
-  assert.deepEqual(parsed.body.value.raw, parseAccountsYaml(yaml).map)
+  // `raw` is gone — it echoed the parsed mapping, plaintext 授权码 included — so
+  // agreement with the pure helper is asserted through the projection both sides
+  // can see: the account names, and each card's identity fields.
+  assert.equal('raw' in parsed.body.value, false)
+  const helperMap = parseAccountsYaml(yaml).map
+  assert.deepEqual(Object.keys(helperMap), ['work'])
+  assert.equal(parsed.body.value.list.length, 1)
+  assert.equal(parsed.body.value.list[0].name, 'work')
+  assert.equal(parsed.body.value.list[0].provider, helperMap.work.provider)
+  assert.equal(parsed.body.value.list[0].user, helperMap.work.user)
   assert.equal(parsed.body.value.defaultAccount, 'work')
 
   // The degrade path must match the pure stringify writer exactly.
@@ -1172,7 +1295,7 @@ test('serializeAccounts: a built-in name wins over a custom preset that shadows 
   assert.equal(resolved.accounts.get('work').imap.host, 'imap.qq.com', 'built-ins are looked up first')
 })
 
-test('serializeAccounts washes hand-written endpoints out of an existing account', async t => {
+test('serializeAccounts keeps hand-written endpoints while the provider is unchanged, and washes them on a provider switch', async t => {
   const { post } = mount(t)
   const source = [
     'work:',
@@ -1186,23 +1309,46 @@ test('serializeAccounts washes hand-written endpoints out of an existing account
     '  smtp: { host: smtp.old.example }',
     '',
   ].join('\n')
-  const { status, body } = await post({
+
+  // Saving without touching the provider must not move the connection target.
+  // Runtime resolution prefers the account's own host, so washing here would
+  // silently repoint a working self-hosted account at the preset merely because
+  // the user opened the settings panel.
+  const kept = await post({
     action: 'serializeAccounts',
     accountsYaml: source,
     defaultAccount: 'work',
     accounts: [{ name: 'work', provider: 'qq', user: 'w@qq.com' }],
   })
-  assert.equal(status, 200)
-  const out = body.value.accountsYaml
-  assert.equal(/imap\.old\.example|smtp\.old\.example/.test(out), false, 'the stored endpoints are washed away')
-  const parsed = parseAccountsYaml(out)
-  assert.equal(parsed.map.work.provider, 'qq')
-  assert.equal(parsed.map.work.password, 'pw', 'washing endpoints must not cost the stored secret')
-  assert.equal(parsed.map.work.user, 'w@qq.com')
-  // The account is now purely "provider qq", so the preset decides the endpoints.
-  const resolved = resolveEmailSettings({ accountsYaml: out })
-  assert.equal(resolved.accounts.get('work').imap.host, 'imap.qq.com')
-  assert.equal(resolved.accounts.get('work').imap.port, 993)
+  assert.equal(kept.status, 200)
+  const unchanged = kept.body.value.accountsYaml
+  assert.match(unchanged, /imap\.old\.example/, 'the endpoints that drive the connection survive an unrelated save')
+  assert.match(unchanged, /smtp\.old\.example/)
+  const keptParsed = parseAccountsYaml(unchanged)
+  assert.equal(keptParsed.map.work.provider, 'qq')
+  assert.equal(keptParsed.map.work.password, 'pw', 'preserving endpoints must not cost the stored secret')
+  assert.equal(keptParsed.map.work.imap.socketTimeoutMs, 9000, 'advanced keys ride along')
+  const keptResolved = resolveEmailSettings({ accountsYaml: unchanged })
+  assert.equal(keptResolved.accounts.get('work').imap.host, 'imap.old.example')
+  assert.equal(keptResolved.accounts.get('work').imap.port, 143)
+
+  // Switching the provider is the one case where the stored endpoints are stale
+  // by definition: they belong to the previous provider, so they are washed and
+  // the new preset decides.
+  const switched = await post({
+    action: 'serializeAccounts',
+    accountsYaml: unchanged,
+    defaultAccount: 'work',
+    accounts: [{ name: 'work', provider: '163', user: 'w@qq.com' }],
+  })
+  assert.equal(switched.status, 200)
+  const washed = switched.body.value.accountsYaml
+  assert.equal(/imap\.old\.example|smtp\.old\.example/.test(washed), false, 'a provider switch washes the previous provider\'s endpoints')
+  const washedParsed = parseAccountsYaml(washed)
+  assert.equal(washedParsed.map.work.password, 'pw', 'washing endpoints must not cost the stored secret')
+  const washedResolved = resolveEmailSettings({ accountsYaml: washed })
+  assert.equal(washedResolved.accounts.get('work').imap.host, 'imap.163.com')
+  assert.equal(washedResolved.accounts.get('work').imap.port, 993)
 })
 
 test('snapshot: a custom preset fills the card and reports its label', async t => {
@@ -1312,14 +1458,13 @@ test('save action: a value naming a custom preset in effect is accepted', async 
   assert.match(rejected.body.error.message, /未知的邮箱服务商 "corp"/)
 })
 
-test('an account with no provider loses its hand-written endpoints on save (documented consequence)', async t => {
+test('a provider-less custom-server account keeps its hand-written endpoints on save', async t => {
   const { post } = mount(t)
-  // 「自定义服务器」 is the one card shape with no preset behind it, so its
-  // endpoints live only in the YAML. The wash is unconditional by design —
-  // every account endpoint is preset-derived — which means such an account has
-  // nothing left to resolve and says so. Pinned deliberately: if the front end
-  // keeps offering a provider-less card, it must stop posting endpoints and
-  // start requiring a preset, or this test is the tripwire that fires.
+  // 「自定义服务器」 is a supported shape, not a degenerate one: the unknown
+  // provider error in src/config.ts tells users to「省略 provider 直接填
+  // imap.host 与 smtp.host」. Its endpoints live only in the YAML, so washing
+  // them would break the account the first time the user saved the panel —
+  // provider is unchanged (absent before and after), so nothing is stale here.
   const source = 'work: { user: w@corp.example, password: pw, imap: { host: imap.corp, port: 143 }, smtp: { host: smtp.corp } }\n'
   const { status, body } = await post({
     action: 'serializeAccounts',
@@ -1335,11 +1480,15 @@ test('an account with no provider loses its hand-written endpoints on save (docu
   })
   assert.equal(status, 200)
   const out = body.value.accountsYaml
-  assert.equal(/imap\.corp|smtp\.corp|host:/.test(out), false, 'the endpoints are gone')
+  assert.match(out, /imap\.corp/, 'the hand-written IMAP host survives')
+  assert.match(out, /smtp\.corp/, 'the hand-written SMTP host survives')
   const parsed = parseAccountsYaml(out)
   assert.equal(parsed.map.work.user, 'w@corp.example')
-  assert.equal(parsed.map.work.password, 'pw', 'the credentials survive — only the endpoints are dropped')
-  assert.throws(() => resolveEmailSettings({ accountsYaml: out }), /imap\.host 未填写/, 'and the loss is reported, not silent')
+  assert.equal(parsed.map.work.password, 'pw')
+  assert.equal(parsed.map.work.provider, undefined, 'still no provider key: the account stays custom')
+  const resolved = resolveEmailSettings({ accountsYaml: out })
+  assert.equal(resolved.accounts.get('work').imap.host, 'imap.corp', 'and it still resolves and connects')
+  assert.equal(resolved.accounts.get('work').imap.port, 143)
 })
 
 // --- OAuth2: the frozen web action contract ----------------------------------
@@ -1353,7 +1502,11 @@ test('an account with no provider loses its hand-written endpoints on save (docu
 const OAUTH_HOME = mkdtempSync(join(tmpdir(), 'dsh-email-web-oauth2-'))
 process.env.DSH_HOME = OAUTH_HOME
 
-const OUTLOOK_YAML = 'work: { provider: outlook, user: w@outlook.com }\n'
+// An invented registration id. The plugin ships no built-in client id — a
+// third-party registration must not travel to everyone who installs it — so an
+// OAuth2 account fixture has to bring its own.
+const FIXTURE_CLIENT_ID = '00000000-0000-4000-8000-000000000000'
+const OUTLOOK_YAML = `work: { provider: outlook, user: w@outlook.com, clientId: ${FIXTURE_CLIENT_ID} }\n`
 const OAUTH_DEVICE_OK = {
   device_code: 'dev-1',
   user_code: 'WXYZ-1234',
@@ -1383,7 +1536,10 @@ function storeToken(name, entry) {
     accounts: {
       ...readTokenStore().accounts,
       [name]: {
-        user: 'w@outlook.com', clientId: 'c', refreshToken: 'r', accessToken: 'a',
+        // The account fixtures log in through FIXTURE_CLIENT_ID, and a token is
+        // bound to the application that minted it: a different id here would
+        // (correctly) read as「换了应用，请重新登录」and mask what these cases assert.
+        user: 'w@outlook.com', clientId: FIXTURE_CLIENT_ID, refreshToken: 'r', accessToken: 'a',
         expiresAt: Date.now() + 3600_000, ...entry,
       },
     },
@@ -1521,7 +1677,7 @@ test('editing the address of a logged-in OAuth2 account makes the card say 未�
   clearTokens()
   storeToken('work')
   // The token belongs to w@outlook.com; the user has just retyped the address.
-  const edited = mount(t, { value: { accountsYaml: 'work: { provider: outlook, user: someone-else@outlook.com }\n' } })
+  const edited = mount(t, { value: { accountsYaml: `work: { provider: outlook, user: someone-else@outlook.com, clientId: ${FIXTURE_CLIENT_ID} }\n` } })
   const card = (await edited.get()).body.value.accountsDetail.list.find(entry => entry.name === 'work')
   assert.equal(card.oauthState, 'none', 'a token for another mailbox is not a login for this account')
   assert.equal('oauthUser' in card, false)
@@ -1536,6 +1692,112 @@ test('editing the address of a logged-in OAuth2 account makes the card say 未�
   assert.equal(calls.length, 1)
 })
 
+test('a card carries the application id, keeps it when silent, and clears it on an empty string', async t => {
+  clearTokens()
+  const { post } = mount(t)
+
+  // A value the user typed lands in the YAML, where resolution picks it up.
+  const written = await post({
+    action: 'serializeAccounts',
+    accountsYaml: '',
+    defaultAccount: 'work',
+    accounts: [{ name: 'work', provider: 'outlook', user: 'w@outlook.com', clientId: ' own-app ' }],
+  })
+  const out = written.body.value.accountsYaml
+  assert.match(out, /clientId: own-app/, 'the id is written trimmed')
+  assert.equal(resolveEmailSettings({ accountsYaml: out }).accounts.get('work').clientId, 'own-app')
+
+  // A card that does not model the field says nothing about it: an unrelated
+  // save must not log the account out of its application.
+  const kept = await post({
+    action: 'serializeAccounts',
+    accountsYaml: out,
+    defaultAccount: 'work',
+    accounts: [{ name: 'work', provider: 'outlook', user: 'w@outlook.com' }],
+  })
+  assert.match(kept.body.value.accountsYaml, /clientId: own-app/, 'an omitted field keeps the stored id')
+
+  // An explicit empty string is the user clearing it on purpose.
+  const cleared = await post({
+    action: 'serializeAccounts',
+    accountsYaml: out,
+    defaultAccount: 'work',
+    accounts: [{ name: 'work', provider: 'outlook', user: 'w@outlook.com', clientId: '' }],
+  })
+  assert.equal(/clientId/.test(cleared.body.value.accountsYaml), false, 'an empty string clears the key')
+
+  // The snapshot hands the value back for the editor to prefill: a public client
+  // id travels in every device-code request, so unlike a password it is not a
+  // secret, and without it the panel cannot show why a login will not start.
+  const { get } = mount(t, { value: { accountsYaml: out } })
+  const card = (await get()).body.value.accountsDetail.list[0]
+  assert.equal(card.clientId, 'own-app')
+})
+
+test('deleting an account clears its stored OAuth2 token, and a refused save does not', async t => {
+  const two = [
+    `work: { provider: outlook, user: w@outlook.com, clientId: ${FIXTURE_CLIENT_ID} }`,
+    `home: { provider: outlook, user: h@outlook.com, clientId: ${FIXTURE_CLIENT_ID} }`,
+    'defaultAccount: work',
+    '',
+  ].join('\n')
+  const one = [`work: { provider: outlook, user: w@outlook.com, clientId: ${FIXTURE_CLIENT_ID} }`, 'defaultAccount: work', ''].join('\n')
+
+  // A conflict must not cost anybody their login: the write never committed.
+  clearTokens()
+  storeToken('work')
+  storeToken('home')
+  const conflicted = mount(t, { value: { accountsYaml: two } })
+  const rejected = await conflicted.post({ action: 'save', expectedRevision: 999, value: { ...BASE, accountsYaml: one } })
+  assert.equal(rejected.status, 409)
+  assert.notEqual(readTokenStore().accounts.home, undefined, 'a refused save leaves every token alone')
+
+  // A committed deletion does: the store is keyed by account name, so a leftover
+  // refresh token would be inherited by whatever account next takes that name.
+  clearTokens()
+  storeToken('work')
+  storeToken('home')
+  const { post } = mount(t, { value: { accountsYaml: two } })
+  const saved = await post({ action: 'save', expectedRevision: 3, value: { ...BASE, accountsYaml: one } })
+  assert.equal(saved.status, 200, JSON.stringify(saved.body))
+  const store = readTokenStore().accounts
+  assert.equal(store.home, undefined, 'the deleted account leaves no credential behind')
+  assert.notEqual(store.work, undefined, 'an account that survives keeps its login')
+})
+
+test('a card can pin the authentication scheme, and take the pin back off', async t => {
+  clearTokens()
+  const yaml = `work: { provider: outlook, user: w@outlook.com, password: fixture-pw, clientId: ${FIXTURE_CLIENT_ID} }\ndefaultAccount: work\n`
+  const { post, get } = mount(t, { value: { accountsYaml: yaml } })
+
+  // The snapshot reports what is pinned separately from the effective verdict:
+  // without that split「自动」and「显式密码」look identical in the editor and the
+  // escape hatch cannot be driven from the panel at all.
+  const before = (await get()).body.value.accountsDetail.list[0]
+  assert.equal(before.authKind, 'oauth2')
+  assert.equal('authKindDeclared' in before, false, 'nothing is pinned yet')
+
+  const card = extra => ({ name: 'work', provider: 'outlook', user: 'w@outlook.com', clientId: FIXTURE_CLIENT_ID, ...extra })
+  const save = (source, accounts) => post({ action: 'serializeAccounts', accountsYaml: source, defaultAccount: 'work', accounts })
+
+  const pinned = await save(yaml, [card({ authKind: 'password' })])
+  const pinnedYaml = pinned.body.value.accountsYaml
+  assert.match(pinnedYaml, /authKind: password/)
+  assert.equal(resolveEmailSettings({ accountsYaml: pinnedYaml }).accounts.get('work').authKind, 'password',
+    'the pin is what resolution honors, so a tenant still on basic auth keeps working')
+
+  const declared = mount(t, { value: { accountsYaml: pinnedYaml } })
+  const declaredCard = (await declared.get()).body.value.accountsDetail.list[0]
+  assert.equal(declaredCard.authKindDeclared, 'password', 'the editor can render the pin back')
+  assert.equal(declaredCard.authKind, 'password', 'and the verdict follows it')
+
+  const auto = await save(pinnedYaml, [card({ authKind: '' })])
+  assert.equal(/authKind/.test(auto.body.value.accountsYaml), false, 'an empty string takes the pin off, it does not store one')
+
+  const kept = await save(pinnedYaml, [card({})])
+  assert.match(kept.body.value.accountsYaml, /authKind: password/, 'a card that does not model the field keeps the stored pin')
+})
+
 test('parseAccounts reports the same OAuth2 projection as the snapshot', async t => {
   clearTokens()
   storeToken('work')
@@ -1546,6 +1808,34 @@ test('parseAccounts reports the same OAuth2 projection as the snapshot', async t
   assert.equal(card.authKind, 'oauth2')
   assert.equal(card.oauthState, 'logged-in')
   assert.equal(card.oauthUser, 'w@outlook.com')
+})
+
+test('a card honors an authKind the account pins, so the panel and the pool agree', async t => {
+  clearTokens()
+  const yaml = [
+    'pinned: { provider: outlook, user: p@outlook.com, password: app-pw, authKind: password }',
+    'derived: { provider: outlook, user: d@outlook.com }',
+    'typo: { provider: outlook, user: t@outlook.com, authKind: magic }',
+    'defaultAccount: pinned',
+    '',
+  ].join('\n')
+  const { get } = mount(t, { value: { accountsYaml: yaml } })
+  const list = (await get()).body.value.accountsDetail.list
+  const byName = Object.fromEntries(list.map(card => [card.name, card]))
+
+  // Without this the card would claim oauth2 for a mailbox the pool connects
+  // with a password: it would render「未登录」and offer a device-code login for
+  // an account that never needs one.
+  assert.equal(byName.pinned.authKind, 'password')
+  assert.equal(byName.pinned.oauthState, 'none')
+  assert.equal('oauthUser' in byName.pinned, false)
+  assert.equal(byName.pinned.hasPassword, true, 'the app password is still there to report')
+
+  assert.equal(byName.derived.authKind, 'oauth2', 'an unpinned account still derives')
+
+  // A value config resolution will report as invalid must not take the card
+  // down: it falls back to the derivation and the error surfaces on resolve.
+  assert.equal(byName.typo.authKind, 'oauth2')
 })
 
 test('test action: an OAuth2 account with no token says to log in and never dials', async t => {
@@ -1613,4 +1903,77 @@ test('an OAuth2 account round-trips through the card editor without a password',
   const resolved = resolveEmailSettings({ accountsYaml: out })
   assert.equal(resolved.accounts.get('work').authKind, 'oauth2')
   assert.equal(resolved.accounts.get('work').user, 'w@outlook.com')
+})
+
+test('serializeAccounts: 别名三件套（senderName/authUser/authPassword）遵循三态契约', async t => {
+  const { post } = mount(t)
+  const source = 'work: { provider: qq, user: alias@qq.com, password: pw, senderName: 别名, authUser: login@qq.com, authPassword: realpw }\ndefaultAccount: work\n'
+
+  // 卡片什么都没说 = 原样保留（包括没被提及的 password）
+  const kept = await post({ action: 'serializeAccounts', accountsYaml: source, defaultAccount: 'work', accounts: [{ name: 'work', provider: 'qq', user: 'alias@qq.com' }] })
+  assert.equal(kept.body.ok, true)
+  const keptWork = parseAccountsYaml(kept.body.value.accountsYaml).map.work
+  assert.equal(keptWork.senderName, '别名')
+  assert.equal(keptWork.authUser, 'login@qq.com')
+  assert.equal(keptWork.authPassword, 'realpw')
+  assert.equal(keptWork.password, 'pw')
+
+  // '' = 明确清除
+  const cleared = await post({ action: 'serializeAccounts', accountsYaml: source, defaultAccount: 'work', accounts: [{ name: 'work', provider: 'qq', user: 'alias@qq.com', senderName: '', authUser: '', authPassword: '' }] })
+  const clearedWork = parseAccountsYaml(cleared.body.value.accountsYaml).map.work
+  assert.equal('senderName' in clearedWork, false)
+  assert.equal('authUser' in clearedWork, false)
+  assert.equal('authPassword' in clearedWork, false)
+
+  // 非空 = 写入
+  const written = await post({ action: 'serializeAccounts', accountsYaml: source, defaultAccount: 'work', accounts: [{ name: 'work', provider: 'qq', user: 'alias@qq.com', senderName: '新别名', authUser: 'other@qq.com', authPassword: 'newpw' }] })
+  const writtenWork = parseAccountsYaml(written.body.value.accountsYaml).map.work
+  assert.equal(writtenWork.senderName, '新别名')
+  assert.equal(writtenWork.authUser, 'other@qq.com')
+  assert.equal(writtenWork.authPassword, 'newpw')
+
+  // 卡片投影：显示名/登录名回给编辑器，登录密码只给布尔
+  const snapshot = await post({ action: 'parseAccounts', value: { accountsYaml: source } })
+  const card = snapshot.body.value.list.find(entry => entry.name === 'work')
+  assert.equal(card.senderName, '别名')
+  assert.equal(card.authUser, 'login@qq.com')
+  assert.equal(card.hasAuthPassword, true)
+  assert.equal('authPassword' in card, false)
+})
+
+test('an OAuth2 card with no clientId of its own reports the built-in application', async t => {
+  clearTokens()
+  const yaml = [
+    'work: { provider: outlook, user: w@outlook.com }',
+    'mail: { provider: qq, user: m@qq.com, password: pw }',
+    'defaultAccount: work',
+    '',
+  ].join('\n')
+  const { get } = mount(t, { value: { accountsYaml: yaml } })
+  const list = (await get()).body.value.accountsDetail.list
+  const work = list.find(card => card.name === 'work')
+  const mail = list.find(card => card.name === 'mail')
+  assert.equal(work.clientId, undefined, 'the account names no application of its own')
+  assert.equal(work.oauthDefaultClientId, OUTLOOK_OAUTH2_CLIENT_ID,
+    'so the card reports the application that will be used: the consent screen names it')
+  assert.equal(mail.oauthDefaultClientId, undefined, 'a password account has no application to report')
+
+  // An id of its own is the application that gets used, so the built-in
+  // fallback drops out instead of being offered as an alternative.
+  const own = mount(t, { value: { accountsYaml: 'work: { provider: outlook, user: w@outlook.com, clientId: own-app }\n' } })
+  const card = (await own.get()).body.value.accountsDetail.list[0]
+  assert.equal(card.clientId, 'own-app')
+  assert.equal(card.oauthDefaultClientId, undefined)
+})
+
+test('the settings editor names the application an empty clientId falls back to', () => {
+  const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
+  // Leave-empty must not read as「cannot log in」: the editor previews the app
+  // that will actually be used, and keeps the「register one」warning for builds
+  // that carry no built-in application at all.
+  assert.match(source, /card\.oauthDefaultClientId/, 'the built-in id comes from the card')
+  assert.equal((source.match(/"oauth\.clientIdBuiltIn":/g) ?? []).length, 2, 'zh + en both state which app is used')
+  assert.match(source, /builtInClientId !== "" \? builtInClientId/, 'the field previews the app in effect')
+  assert.match(source, /builtInClientId === ""\s*\n\s*\? h\("div", \{ className: "dshe-alert warn" \}/,
+    'the「no application」warning is only for builds without a built-in app')
 })

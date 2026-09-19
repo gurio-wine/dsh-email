@@ -26,9 +26,25 @@ export const OUTLOOK_PROVIDER = 'outlook'
 export const OUTLOOK_IMAP_HOST = 'outlook.office365.com'
 
 /**
- * The client id of the public application this plugin uses for the device-code
- * flow. A well-known multi-tenant registration with the IMAP/SMTP delegated
- * permissions; an account may override it with its own `clientId`.
+ * The built-in client id for the device-code flow: a community registration.
+ *
+ * Requiring every Outlook user to register an application of their own puts a
+ * setup wall in front of the one provider where OAuth2 cannot be avoided, so
+ * the plugin ships one. The id below is the public-client registration
+ * contributed by gurio-wine (PR #13) and used with their permission; the README
+ * credits them and states the two things that follow from using somebody
+ * else's application: the consent screen names *their* app, and the sign-in
+ * logs land in *their* tenant along with the user's UPN.
+ *
+ * An account that wants neither — an enterprise that refuses third-party apps,
+ * or a day when this registration is gone — sets its own `clientId` (a free
+ * Entra public-client registration) and that value wins over this constant.
+ * The settings card shows which application is in effect either way, so nobody
+ * consents to an app they were not told about.
+ *
+ * Replacing this constant is the whole change a maintainer makes to ship the
+ * project's own application instead. Tokens are bound to the id that issued
+ * them, so such a release asks every built-in account to log in one more time.
  */
 export const OUTLOOK_OAUTH2_CLIENT_ID = '15dcd5aa-00dd-487f-82d7-1d2b2c299e14'
 
@@ -59,10 +75,34 @@ export interface AccountConfig {
   user?: string
   password?: string
   /**
+   * Display name for the From header. The address stays `user` — recipients
+   * must see the mailbox that owns the mail, not the login.
+   */
+  senderName?: string
+  /**
+   * Login handed to IMAP/SMTP when it differs from `user`: the alias case,
+   * where `user` is the address mail is sent *from* and the server only
+   * authenticates the real account, or a relay whose login is not a mailbox
+   * at all. Defaults to `user`.
+   */
+  authUser?: string
+  /** Password that goes with `authUser`. Defaults to `password`. */
+  authPassword?: string
+  /**
    * Public-client id used by the OAuth2 device-code flow. Only read for an
    * OAuth2 account, where it overrides OUTLOOK_OAUTH2_CLIENT_ID.
    */
   clientId?: string
+  /**
+   * Escape hatch over the derived authentication scheme. Left unset, an account
+   * pointed at the `outlook` provider or the Exchange Online IMAP host is an
+   * OAuth2 account and its password is dropped. Set `password` to keep using an
+   * app password there — a tenant that still accepts basic auth (hybrid or
+   * on-prem, SMTP AUTH left enabled), or a mailbox that worked before this
+   * derivation existed, must not be told「尚未登录」after an upgrade. Set
+   * `oauth2` to opt in from a custom host.
+   */
+  authKind?: AuthKind
   imap?: ImapConfig
   smtp?: SmtpConfig
   inboxFolder?: string
@@ -134,12 +174,21 @@ const DEFAULT_IDLE_TIMEOUT_MS = 60000
 /** Fully resolved, validated configuration for one account. */
 export interface ResolvedEmailConfig {
   user: string
+  /** Display name for the From header, '' when the account does not set one. */
+  senderName: string
+  /** Login actually handed to IMAP/SMTP (== user unless authUser is set). */
+  authUser: string
+  /** Password for authUser (== password unless authPassword is set). */
+  authPassword: string
   /**
    * The app password / 授权码. Empty for an OAuth2 account — that is the point:
    * nothing is stored, the token store holds the credential instead.
    */
   password: string
-  /** How this account authenticates. Chosen by `provider`, never by the user directly. */
+  /**
+   * How this account authenticates. Derived from `provider` / the IMAP host
+   * unless the account pins it with an explicit `authKind`.
+   */
   authKind: AuthKind
   /** Public-client id for the device-code flow (OAuth2 accounts only). */
   clientId?: string
@@ -327,6 +376,7 @@ export function resolveEmailSettings(config: EmailConfig | undefined): ResolvedE
     user: raw.user,
     password: raw.password,
     clientId: raw.clientId,
+    authKind: raw.authKind,
     imap: raw.imap,
     smtp: raw.smtp,
     inboxFolder: raw.inboxFolder,
@@ -440,6 +490,12 @@ function resolveAccount(
   // The settings form uses '' for an empty password. In single-account mode
   // that explicitly selects the environment fallback; named accounts stay isolated.
   const password = (acc.password ?? common.password) || (allowEnvPassword ? process.env[EMAIL_PASSWORD_ENV] ?? '' : '')
+  // An alias account sends from `user` but authenticates as somebody else, and a
+  // relay may use a different password than the mailbox it delivers for. Both
+  // default to the single-account pair so nothing changes for existing setups.
+  const authUser = (acc.authUser ?? common.authUser ?? '').trim() || user
+  const authPassword = (acc.authPassword ?? common.authPassword) || password
+  const senderName = (acc.senderName ?? common.senderName ?? '').trim()
   const imap = {
     host: acc.imap?.host ?? common.imap?.host ?? preset?.imap.host,
     port: acc.imap?.port ?? common.imap?.port ?? preset?.imap.port,
@@ -454,11 +510,22 @@ function resolveAccount(
   }
   const problems: string[] = []
   if (user === '') problems.push(`账号 "${name}" 的 user（邮箱地址）未填写`)
+  // An explicit `authKind` outranks the derivation: a tenant that still accepts
+  // an app password for Exchange Online, or a mailbox that worked before the
+  // derivation existed, keeps working instead of being told「尚未登录」.
+  const forcedAuthKind = String(acc.authKind ?? common.authKind ?? '').trim().toLowerCase()
+  if (forcedAuthKind !== '' && forcedAuthKind !== 'oauth2' && forcedAuthKind !== 'password') {
+    problems.push(`账号 "${name}" 的 authKind 只能是 oauth2 或 password，当前是 "${forcedAuthKind}"`)
+  }
+  const oauth2 = forcedAuthKind === 'password'
+    ? false
+    : forcedAuthKind === 'oauth2' || isOAuth2Account(requested, imap.host)
   // An OAuth2 account has no password on purpose: its credential is the token
   // in the OAuth2 store, and requiring a password would demand a secret
   // Microsoft no longer accepts for Exchange Online.
-  const oauth2 = isOAuth2Account(requested, imap.host)
-  if (!oauth2 && password === '') problems.push(`账号 "${name}" 的 password 未填写（单账号可用环境变量 ${EMAIL_PASSWORD_ENV}）`)
+  if (!oauth2 && authPassword === '') {
+    problems.push(`账号 "${name}" 的 ${authUser === user ? 'password' : 'authPassword'} 未填写（单账号可用环境变量 ${EMAIL_PASSWORD_ENV}）`)
+  }
   if (imap.host === undefined || imap.host === '') problems.push(`账号 "${name}" 的 imap.host 未填写（可填 provider 预设：${known.join('/')}）`)
   if (smtp.host === undefined || smtp.host === '') problems.push(`账号 "${name}" 的 smtp.host 未填写（同上）`)
   if (problems.length > 0) {
@@ -467,8 +534,13 @@ function resolveAccount(
   const clientId = (acc.clientId ?? common.clientId ?? '').trim()
   return {
     user,
-    // An OAuth2 account never carries a password: a stale one left in the YAML
-    // from before the provider changed must not travel into the pool.
+    senderName,
+    // OAuth2 logs in with the token's own account, so the alias login pair only
+    // exists for password accounts; and an OAuth2 account never carries a
+    // password at all — a stale one left in the YAML from before the provider
+    // changed must not travel into the pool.
+    authUser: oauth2 ? user : authUser,
+    authPassword: oauth2 ? '' : authPassword,
     password: oauth2 ? '' : password,
     authKind: oauth2 ? 'oauth2' : 'password',
     ...(clientId !== '' ? { clientId } : {}),

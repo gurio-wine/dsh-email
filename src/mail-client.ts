@@ -5,11 +5,12 @@ import { join } from 'node:path'
 import type { Readable } from 'node:stream'
 import type { AuthKind, ResolvedEmailConfig, ResolvedEmailSettings } from './config.js'
 import { getFreshAccessToken, OAuth2Error } from './oauth2.js'
-import { flattenAddresses, parseRawMessage, sanitizeFilename } from './parse.js'
+import { flattenAddresses, parseRawMessage, sanitizeFilename, stripHtml, truncateText } from './parse.js'
 import type {
   AddressEntry,
   EmailAttachmentMeta,
   EmailAttachmentResult,
+  EmailFolderRow,
   EmailFoldersResult,
   EmailListResult,
   EmailMarkAction,
@@ -33,6 +34,27 @@ export function messageOf(error: unknown, fallback: string): string {
   return error instanceof Error && error.message !== '' ? error.message : fallback
 }
 
+/**
+ * Replace anything credential-shaped in a server's own error text before it
+ * reaches a user.
+ *
+ * IMAP and SMTP servers routinely quote back the authentication string they
+ * rejected. For XOAUTH2 that string is `user=…\x01auth=Bearer <token>\x01\x01`,
+ * usually base64'd — so the raw message carries a live access token, and these
+ * messages are rendered in the settings panel, returned by the mail tools, and
+ * pasted into bug reports.
+ *
+ * Two shapes are masked: a JWT (three base64url segments, which is what every
+ * OAuth2 access token looks like) and a long base64 run (the quoted XOAUTH2
+ * blob). The replacement keeps the length so a report still says how big the
+ * thing was, without saying what it was.
+ */
+export function redactCredentials(text: string): string {
+  return text
+    .replace(/[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{12,}\.[A-Za-z0-9_-]{8,}/g, match => `<已隐去 ${match.length} 字符的令牌>`)
+    .replace(/[A-Za-z0-9+/]{40,}={0,2}/g, match => `<已隐去 ${match.length} 字符的凭据>`)
+}
+
 /** The IMAP auth shape imapflow accepts: a password, or an OAuth2 access token. */
 export interface ImapAuth {
   user: string
@@ -45,12 +67,9 @@ export interface ImapAuth {
  * nodemailer's typings model, not a loose string: anything wider makes the
  * whole transport options object fail to match and silently degrades the type.
  */
-export interface SmtpAuth {
-  type?: 'LOGIN' | 'OAuth2'
-  method?: string
-  user: string
-  pass: string
-}
+export type SmtpAuth =
+  | { user: string; pass: string }
+  | { type: 'OAuth2'; user: string; accessToken: string }
 
 /**
  * The IMAP `auth` block for one account. Pure so the shape the library
@@ -58,24 +77,20 @@ export interface SmtpAuth {
  * `accessToken` (imapflow then runs AUTHENTICATE XOAUTH2) and a password
  * account with `pass`, exactly as before.
  */
-export function imapAuthOf(cfg: Pick<ResolvedEmailConfig, 'user' | 'password' | 'authKind'>, accessToken?: string): ImapAuth {
+export function imapAuthOf(cfg: Pick<ResolvedEmailConfig, 'authUser' | 'authPassword' | 'authKind'>, accessToken?: string): ImapAuth {
   return cfg.authKind === 'oauth2'
-    ? { user: cfg.user, accessToken: accessToken ?? '' }
-    : { user: cfg.user, pass: cfg.password }
+    ? { user: cfg.authUser, accessToken: accessToken ?? '' }
+    : { user: cfg.authUser, pass: cfg.authPassword }
 }
 
 /**
- * The SMTP `auth` block. nodemailer's own OAuth2 helper refreshes tokens on
- * its own schedule and cannot be handed this plugin's token store, so the
- * short-lived access token is passed as the password with `method: 'XOAUTH2'`:
- * that is the mechanism the mail server expects, with the refresh owned here.
- * (`type: 'OAuth2'` would send nodemailer into its own refresh flow, which has
- * no refresh token and therefore fails.)
+ * Nodemailer consumes an OAuth2 token through accessToken, not pass.
+ * Refresh remains owned by this plugin; no refresh credentials leave here.
  */
-export function smtpAuthOf(cfg: Pick<ResolvedEmailConfig, 'user' | 'password' | 'authKind'>, accessToken?: string): SmtpAuth {
+export function smtpAuthOf(cfg: Pick<ResolvedEmailConfig, 'authUser' | 'authPassword' | 'authKind'>, accessToken?: string): SmtpAuth {
   return cfg.authKind === 'oauth2'
-    ? { type: 'OAuth2', method: 'XOAUTH2', user: cfg.user, pass: accessToken ?? '' }
-    : { user: cfg.user, pass: cfg.password }
+    ? { type: 'OAuth2', user: cfg.authUser, accessToken: accessToken ?? '' }
+    : { user: cfg.authUser, pass: cfg.authPassword }
 }
 
 /** The message an OAuth2 account gets when the mailbox has to be logged into again. */
@@ -153,6 +168,49 @@ export function selectAttachmentPart(
   return byTypeAndSize
 }
 
+interface TextBodyPart {
+  /** IMAP section id; a single-part message has no part number and uses "1". */
+  key: string
+  type: string
+}
+
+/**
+ * Leaf text/* parts that can carry the message body, attachment parts excluded.
+ * This is what email_read / the search fallback fetch instead of the whole
+ * source: a 20 MiB attachment must not be downloaded just to read the text.
+ */
+function collectTextParts(node: any, out: TextBodyPart[] = []): TextBodyPart[] {
+  if (node === null || node === undefined || typeof node !== 'object') return out
+  // message/rfc822 整段是一封内嵌邮件（附件），它的正文分段不是本封的正文。
+  if (typeof node.type === 'string' && node.type.toLowerCase().startsWith('message/rfc822')) return out
+  const children = Array.isArray(node.childNodes) ? node.childNodes : []
+  if (children.length === 0) {
+    const type = typeof node.type === 'string' ? node.type.toLowerCase() : ''
+    if (type.startsWith('text/') && node.disposition !== 'attachment') {
+      out.push({ key: node.part === undefined || node.part === null ? '1' : String(node.part), type })
+    }
+    return out
+  }
+  for (const child of children) collectTextParts(child, out)
+  return out
+}
+
+/** The body parts worth fetching: text/plain first, text/html as the fallback. */
+function selectBodyParts(node: any): { plain?: TextBodyPart; html?: TextBodyPart } {
+  const parts = collectTextParts(node)
+  const plain = parts.find(part => part.type === 'text/plain')
+  const html = parts.find(part => part.type === 'text/html')
+  return {
+    ...(plain !== undefined ? { plain } : {}),
+    ...(html !== undefined ? { html } : {}),
+  }
+}
+
+/** The From header: `user` is the visible address, `senderName` only labels it. */
+function senderOf(cfg: Pick<ResolvedEmailConfig, 'user' | 'senderName'>): string | { name: string; address: string } {
+  return cfg.senderName === '' ? cfg.user : { name: cfg.senderName, address: cfg.user }
+}
+
 /** Case-insensitive match of a query against subject/from/body text. */
 export function messageMatchesQuery(subject: string, fromText: string, body: string, query: string): boolean {
   const q = query.toLowerCase()
@@ -199,12 +257,13 @@ function formatAddress(entry: AddressEntry): string {
   return entry.name !== undefined && entry.name !== '' ? entry.name + ' <' + entry.address + '>' : entry.address
 }
 
-function dedupeAddresses(entries: AddressEntry[], exclude: string): AddressEntry[] {
+function dedupeAddresses(entries: AddressEntry[], exclude: string | readonly string[]): AddressEntry[] {
   const seen = new Set<string>()
+  const excluded = new Set((Array.isArray(exclude) ? exclude : [exclude]).map(a => a.trim().toLowerCase()).filter(a => a !== ''))
   const out: AddressEntry[] = []
   for (const entry of entries) {
     const addr = (entry.address ?? '').toLowerCase()
-    if (addr === '' || addr === exclude || seen.has(addr)) continue
+    if (addr === '' || excluded.has(addr) || seen.has(addr)) continue
     seen.add(addr)
     out.push(entry)
   }
@@ -223,9 +282,9 @@ const FORWARD_MAX_CHARS = 4000
  * be tested without a connection: recipients exclude the sending account,
  * subject prefixes never stack, the original text is quoted underneath.
  */
-export function buildReplyMessage(original: OriginalDigest, mode: EmailReplyMode, selfAddress: string, text: string, forwardTo = ''): BuiltReply {
+export function buildReplyMessage(original: OriginalDigest, mode: EmailReplyMode, selfAddress: string | readonly string[], text: string, forwardTo = ''): BuiltReply {
   const fromText = original.from.map(a => a.name ?? a.address).filter(Boolean).join(', ') || '(未知发件人)'
-  const self = selfAddress.toLowerCase()
+  const self = (Array.isArray(selfAddress) ? selfAddress : [selfAddress]).filter(a => a.trim() !== '')
   if (mode === 'forward') {
     const to = forwardTo.trim()
     if (to === '') throw new MailError('forward 模式需要 to 参数指定转发收件人')
@@ -302,6 +361,19 @@ interface ImapEntry {
   inUse: number
 }
 
+/** email_attachment reuses the MIME index email_read already parsed; keep a few. */
+const READ_CACHE_MAX = 16
+const READ_CACHE_TTL_MS = 10 * 60 * 1000
+
+/** Folder names change rarely; a short TTL keeps email_folders off the wire. */
+const FOLDER_CACHE_TTL_MS = 60 * 1000
+
+interface CachedAttachmentIndex {
+  attachments: Array<{ filename: string; contentType: string; size: number; part: string }>
+  parts: AttachmentPart[]
+  at: number
+}
+
 /**
  * One mailbox pool for the whole plugin: pooled IMAP connections per
  * account plus pooled SMTP transporters, with idle sweep and error eviction.
@@ -336,6 +408,74 @@ export class EmailPool {
     const next = prev.then(run, run)
     this.queues.set(name, next.then(() => undefined, () => undefined))
     return next
+  }
+
+  private readonly readCache = new Map<string, CachedAttachmentIndex>()
+  private readonly folderCache = new Map<string, { at: number; folders: EmailFolderRow[] }>()
+
+  /** UIDVALIDITY 变了以后同一 uid 可能指向另一封邮件，缓存键必须带上它。 */
+  private uidValidityOf(client: ImapFlow): number {
+    const mailbox = client.mailbox
+    return mailbox === false ? 0 : Number(mailbox.uidValidity ?? 0)
+  }
+
+  /** Remember a parsed attachment index so email_attachment can skip the refetch. */
+  private rememberRead(account: string, folder: string, uidValidity: number, uid: number, parsed: Omit<CachedAttachmentIndex, 'at'>): void {
+    const key = account + '\u0000' + folder + '\u0000' + uidValidity + '\u0000' + uid
+    this.readCache.delete(key)
+    this.readCache.set(key, { ...parsed, at: Date.now() })
+    while (this.readCache.size > READ_CACHE_MAX) {
+      const oldest = this.readCache.keys().next()
+      if (oldest.done === true) break
+      this.readCache.delete(oldest.value)
+    }
+  }
+
+  /**
+   * The attachment index for one message: the cached one when email_read already
+   * produced it, otherwise a fresh parse of the full source plus its bodyStructure.
+   */
+  private async attachmentIndexOf(client: ImapFlow, account: string, folder: string, uid: number, signal?: AbortSignal): Promise<Omit<CachedAttachmentIndex, 'at'>> {
+    const uidValidity = this.uidValidityOf(client)
+    const cached = this.recallRead(account, folder, uidValidity, uid)
+    if (cached !== undefined) return cached
+    // 附件索引只需要 MIME 结构：bodyStructure 已经给出每个附件的 part/名称/大小，
+    // 不必为了拿它先拉整封 source（第一次就下载附件的邮件也一样）。
+    const message = await client.fetchOne(uid, { uid: true, bodyStructure: true }, { uid: true })
+    if (message === false) {
+      throw new MailError('找不到 uid=' + uid + ' 的邮件（可能已被删除，或不在文件夹 "' + folder + '"）')
+    }
+    signal?.throwIfAborted()
+    if (message.bodyStructure !== undefined) {
+      const parts = collectAttachmentParts(message.bodyStructure)
+      const attachments = parts.map(part => ({ filename: part.filename, contentType: part.contentType, size: part.size, part: part.part }))
+      const parsed = { attachments, parts }
+      this.rememberRead(account, folder, uidValidity, uid, parsed)
+      return parsed
+    }
+    // 服务器没给 bodyStructure：退回整封解析，行为和以前一样。
+    const full = message.source !== undefined
+      ? message
+      : await client.fetchOne(uid, { uid: true, source: true, bodyStructure: true }, { uid: true })
+    if (full === false || full.source === undefined) {
+      throw new MailError('找不到 uid=' + uid + ' 的邮件（可能已被删除，或不在文件夹 "' + folder + '"）')
+    }
+    const body = await parseRawMessage(full.source, this.settings.maxBodyChars)
+    signal?.throwIfAborted()
+    const parsed = { attachments: body.attachments, parts: collectAttachmentParts(full.bodyStructure) }
+    this.rememberRead(account, folder, uidValidity, uid, parsed)
+    return parsed
+  }
+
+  private recallRead(account: string, folder: string, uidValidity: number, uid: number): CachedAttachmentIndex | undefined {
+    const key = account + '\u0000' + folder + '\u0000' + uidValidity + '\u0000' + uid
+    const hit = this.readCache.get(key)
+    if (hit === undefined) return undefined
+    if (Date.now() - hit.at > READ_CACHE_TTL_MS) {
+      this.readCache.delete(key)
+      return undefined
+    }
+    return hit
   }
 
   async withImap<T>(
@@ -417,7 +557,7 @@ export class EmailPool {
   private oauth2ErrorOf(error: unknown): Error {
     if (error instanceof OAuth2Error) return new MailError(error.message)
     if (error instanceof MailError) return error
-    return new MailError(OAUTH2_RELOGIN_MESSAGE + '（' + messageOf(error, '未知错误') + '）')
+    return new MailError(OAUTH2_RELOGIN_MESSAGE + '（' + redactCredentials(messageOf(error, '未知错误')) + '）')
   }
 
   private async imapRun<T>(
@@ -595,6 +735,33 @@ export class EmailPool {
     }
   }
 
+  /**
+   * Download one MIME part through imapflow's decode pipeline: transfer
+   * encoding and charset are handled there, maxBytes caps what is fetched.
+   */
+  private async downloadPartText(client: ImapFlow, uid: number, part: TextBodyPart, maxBytes: number, signal?: AbortSignal): Promise<string> {
+    const dl = await client.download(uid, part.key, { uid: true, maxBytes })
+    signal?.throwIfAborted()
+    const buf = await collectStream(dl.content, maxBytes, signal)
+    signal?.throwIfAborted()
+    return buf.toString('utf8')
+  }
+
+  /**
+   * The message body without its attachments. undefined when the structure has
+   * no usable text part or the server refuses the part fetch, so the caller can
+   * fall back to the full-source path for that one message.
+   */
+  private async bodyTextFromParts(client: ImapFlow, uid: number, structure: any, maxBytes: number, signal?: AbortSignal): Promise<string | undefined> {
+    const { plain, html } = selectBodyParts(structure)
+    if (plain !== undefined) {
+      const text = await this.downloadPartText(client, uid, plain, maxBytes, signal)
+      if (text.trim() !== '' || html === undefined) return text
+    }
+    if (html !== undefined) return stripHtml(await this.downloadPartText(client, uid, html, maxBytes, signal))
+    return undefined
+  }
+
   async list(accountName: string | undefined, folder: string, limit: number, offset: number, unreadOnly: boolean, since?: Date, until?: Date, signal?: AbortSignal): Promise<EmailListResult> {
     const name = this.resolveName(accountName)
     const cfg = this.account(name)
@@ -602,6 +769,8 @@ export class EmailPool {
     return this.withImap(name, folderName, async (client) => {
       const mailbox = client.mailbox
       const total = mailbox === false ? 0 : mailbox.exists
+      // imapflow types uidValidity as number | bigint; the wire format is 32-bit.
+      const uidValidity = mailbox === false ? 0 : Number(mailbox.uidValidity ?? 0)
       let scopeCount = total
       let uids: number[] = []
       const hasDateFilter = since !== undefined || until !== undefined
@@ -623,18 +792,49 @@ export class EmailPool {
       uids.reverse()
       const window = uids.slice(offset, offset + limit)
       const messages = await this.fetchListed(client, window, signal)
-      return { account: name, count: scopeCount, folder: folderName, messages }
+      return { account: name, count: scopeCount, folder: folderName, uidValidity, messages }
     }, true, signal)
   }
 
-  async search(accountName: string | undefined, query: string, folder: string, limit: number, since?: Date, until?: Date, signal?: AbortSignal): Promise<EmailSearchResult> {
+  /**
+   * The uid index behind email_watch: SEARCH UNSEEN only, no envelopes and no
+   * bodies. The caller decides which uids it actually needs to report.
+   */
+  async unseenUids(accountName: string | undefined, folder: string, signal?: AbortSignal): Promise<{ account: string; folder: string; uidValidity: number; count: number; uids: number[] }> {
+    const name = this.resolveName(accountName)
+    const cfg = this.account(name)
+    const folderName = folder || cfg.inboxFolder
+    return this.withImap(name, folderName, async (client) => {
+      const mailbox = client.mailbox
+      const uidValidity = mailbox === false ? 0 : Number(mailbox.uidValidity ?? 0)
+      const found = await client.search({ seen: false }, { uid: true })
+      signal?.throwIfAborted()
+      const uids = (found === false ? [] : found).slice().sort((a, b) => b - a)
+      return { account: name, folder: folderName, uidValidity, count: uids.length, uids }
+    }, true, signal)
+  }
+
+  /** Fetch the envelopes for one uid batch: the rows email_watch will report. */
+  async fetchByUids(accountName: string | undefined, folder: string, uids: number[], signal?: AbortSignal): Promise<ListedMessage[]> {
+    if (uids.length === 0) return []
+    const name = this.resolveName(accountName)
+    const cfg = this.account(name)
+    const folderName = folder || cfg.inboxFolder
+    return this.withImap(name, folderName, (client) => this.fetchListed(client, uids, signal), true, signal)
+  }
+
+  async search(accountName: string | undefined, query: string, folder: string, limit: number, offset: number, since?: Date, until?: Date, signal?: AbortSignal): Promise<EmailSearchResult> {
     const name = this.resolveName(accountName)
     const cfg = this.account(name)
     const folderName = folder || cfg.inboxFolder
     return this.withImap(name, folderName, async (client) => {
       // No nested OR and no TEXT search: several servers (QQ among them)
-      // silently answer those with empty or match-everything results.
-      // subject/from/to/cc searches unioned client-side behave well everywhere.
+      // silently answer those with empty results, and some answer with a
+      // non-empty list that has nothing to do with the query at all (QQ again:
+      // an impossible keyword still「matches」every uid in the folder). The
+      // server's hit list is therefore a hint, not an answer: confirm it
+      // against the envelopes before reporting anything, otherwise scan
+      // locally.
       const dateRange: Record<string, unknown> = {}
       if (since !== undefined) dateRange.since = since
       if (until !== undefined) dateRange.before = until
@@ -645,34 +845,71 @@ export class EmailPool {
         client.search({ cc: query, ...dateRange }, { uid: true }),
       ])
       signal?.throwIfAborted()
-      const uids = [...new Set(found.flatMap(result => result === false ? [] : result))].sort((a, b) => a - b)
-      uids.reverse()
-      if (uids.length === 0 && this.settings.bodySearchFallback) {
-        // Server-side search found nothing: fall back to a client-side scan of
-        // the most recent messages (subject/from/body), capped for time.
-        const messages = await this.searchBodies(client, query, folderName, limit, since, until, signal)
-        return { account: name, query, count: messages.length, folder: folderName, messages }
+      const uids = [...new Set(found.flatMap(result => result === false ? [] : result))].sort((a, b) => b - a)
+      if (uids.length > 0) {
+        // The sample has to cover the requested page (offset + limit) — the same
+        // window the fallback scan looks at — so one FETCH serves both the
+        // verification and the rows that are handed out.
+        const confirmed = await this.searchHits(client, uids, query, offset + limit, signal)
+        if (confirmed.length > 0) {
+          // The server's list holds up, so its size is reported as the match
+          // count; only rows that were confirmed are ever handed out.
+          return { account: name, query, count: uids.length, folder: folderName, offset, messages: confirmed.slice(offset, offset + limit) }
+        }
       }
-      const messages = await this.fetchListed(client, uids.slice(0, limit), signal)
-      return { account: name, query, count: uids.length, folder: folderName, messages }
+      // Nothing believable came back (empty answer, or hits that did not
+      // survive verification): scan the newest messages locally instead.
+      if (this.settings.bodySearchFallback) {
+        const messages = await this.searchBodies(client, query, folderName, limit, offset, since, until, signal)
+        // 本地扫描不知道全文件夹有多少匹配，count 只是本页条数：用 countKind
+        // 让渲染说「本页 N 条（仅扫描最近 bodySearchLimit 封）」，不能说「共 N 条」。
+        return {
+          account: name, query, count: messages.length, folder: folderName, offset, messages,
+          countKind: 'scanned', scannedLimit: this.settings.bodySearchLimit,
+        }
+      }
+      return { account: name, query, count: 0, folder: folderName, offset, messages: [] }
     }, true, signal)
   }
 
+  /**
+   * Confirm server-side hits against the mailbox itself: fetch the envelopes
+   * of the newest candidates — the same window the body-scan fallback looks at
+   * — and keep only those that really carry the query in subject/from/to/cc,
+   * the four fields the server was asked about. No body is downloaded here,
+   * and uids the server made up simply return nothing.
+   */
+  private async searchHits(client: ImapFlow, uids: number[], query: string, need: number, signal?: AbortSignal): Promise<ListedMessage[]> {
+    const sample = uids.slice(0, Math.min(uids.length, Math.max(this.settings.bodySearchLimit, need)))
+    signal?.throwIfAborted()
+    const fetched = await client.fetchAll(sample, { uid: true, envelope: true, flags: true, size: true, bodyStructure: true }, { uid: true })
+    signal?.throwIfAborted()
+    return fetched
+      .filter(message => {
+        const envelope = message.envelope
+        const addressText = [envelope?.from, envelope?.to, envelope?.cc].map(flattenAddressText).join(' ')
+        return messageMatchesQuery(envelope?.subject ?? '', addressText, '', query)
+      })
+      .map(message => listedFrom(message, message.size, structureHasAttachment(message.bodyStructure)))
+      .sort((a, b) => b.uid - a.uid)
+  }
+
   /** Client-side scan of the tail of the mailbox, newest first. */
-  private async searchBodies(client: ImapFlow, query: string, folder: string, limit: number, since?: Date, until?: Date, signal?: AbortSignal): Promise<ListedMessage[]> {
+  private async searchBodies(client: ImapFlow, query: string, folder: string, limit: number, offset: number, since?: Date, until?: Date, signal?: AbortSignal): Promise<ListedMessage[]> {
     signal?.throwIfAborted()
     const mailbox = client.mailbox
     const total = mailbox === false ? 0 : mailbox.exists
     if (total === 0) return []
     const start = Math.max(1, total - this.settings.bodySearchLimit + 1)
+    // 只取信封与 MIME 结构；正文在下面按 text/* 分段下载，附件不进正文匹配。
     const fetched = await client.fetchAll(
       start + ':*',
-      { uid: true, envelope: true, flags: true, size: true, bodyStructure: true, source: true, internalDate: true },
+      { uid: true, envelope: true, flags: true, size: true, bodyStructure: true, internalDate: true },
     )
     const out: ListedMessage[] = []
     for (const message of [...fetched].reverse()) {
       signal?.throwIfAborted()
-      if (out.length >= limit) break
+      if (out.length >= offset + limit) break
       const receivedAt = message.internalDate ?? message.envelope?.date
       if (since !== undefined && (receivedAt === undefined || receivedAt < since)) continue
       if (until !== undefined && (receivedAt === undefined || receivedAt >= until)) continue
@@ -681,6 +918,7 @@ export class EmailPool {
         .map(flattenAddressText).join(' ')
       let body = ''
       if (message.source !== undefined) {
+        // 服务器多送了整封 source（测试/旧行为）：直接解析，不必再多一次往返。
         try {
           const parsed = await parseRawMessage(message.source, 4096)
           signal?.throwIfAborted()
@@ -689,12 +927,19 @@ export class EmailPool {
           signal?.throwIfAborted()
           // 单封邮件解析失败不应中断整批回退扫描，继续用 subject/from/to/cc 匹配。
         }
+      } else if (message.bodyStructure !== undefined) {
+        try {
+          body = await this.bodyTextFromParts(client, message.uid, message.bodyStructure, 4096 * 4, signal) ?? ''
+        } catch (error) {
+          signal?.throwIfAborted()
+          // 单封邮件分段下载失败不应中断整批回退扫描，继续用 subject/from/to/cc 匹配。
+        }
       }
       if (messageMatchesQuery(subject, recipientSearchText, body, query)) {
         out.push(listedFrom(message, message.size, structureHasAttachment(message.bodyStructure)))
       }
     }
-    return out
+    return out.slice(offset, offset + limit)
   }
 
   private async fetchListed(client: ImapFlow, uids: number[], signal?: AbortSignal): Promise<ListedMessage[]> {
@@ -716,12 +961,55 @@ export class EmailPool {
     const cfg = this.account(name)
     const folderName = folder || cfg.inboxFolder
     return this.withImap(name, folderName, async (client) => {
-      const message = await client.fetchOne(uid, { uid: true, source: true }, { uid: true })
-      if (message === false || message.source === undefined) {
+      // 先只要信封与 MIME 结构，正文按 text/* 分段下载：带 20 MiB 附件的邮件
+      // 只为看正文时不再整封拉下来，附件元数据直接复用 bodyStructure。
+      const message = await client.fetchOne(uid, { uid: true, envelope: true, bodyStructure: true }, { uid: true })
+      if (message === false) {
         throw new MailError('找不到 uid=' + uid + ' 的邮件（可能已被删除，或不在文件夹 "' + folderName + '"；可用 email_list 重新获取 uid）')
       }
-      const body = await parseRawMessage(message.source, this.settings.maxBodyChars)
       signal?.throwIfAborted()
+      if (message.source === undefined && message.envelope !== undefined && message.bodyStructure !== undefined) {
+        try {
+          const text = await this.bodyTextFromParts(client, uid, message.bodyStructure, this.settings.maxBodyChars * 4 + 4096, signal)
+          if (text !== undefined) {
+            const limited = truncateText(text, this.settings.maxBodyChars)
+            const parts = collectAttachmentParts(message.bodyStructure)
+            const attachments: EmailAttachmentMeta[] = parts.map(part => ({
+              filename: part.filename,
+              contentType: part.contentType,
+              size: part.size,
+              part: part.part,
+            }))
+            this.rememberRead(name, folderName, this.uidValidityOf(client), uid, { attachments, parts })
+            const envelopeDate = message.envelope.date
+            return {
+              account: name,
+              uid,
+              folder: folderName,
+              date: envelopeDate instanceof Date ? envelopeDate.toISOString() : '',
+              from: flattenAddresses(message.envelope.from),
+              to: flattenAddresses(message.envelope.to),
+              cc: flattenAddresses(message.envelope.cc),
+              subject: message.envelope.subject ?? '',
+              text: limited.text,
+              attachments,
+              truncated: limited.truncated,
+            }
+          }
+        } catch (error) {
+          signal?.throwIfAborted()
+          // 分段读取失败（服务器拒绝该分段或结构异常）：这一封退回整封解析。
+        }
+      }
+      const full = message.source !== undefined
+        ? message
+        : await client.fetchOne(uid, { uid: true, source: true, bodyStructure: true }, { uid: true })
+      if (full === false || full.source === undefined) {
+        throw new MailError('找不到 uid=' + uid + ' 的邮件（可能已被删除，或不在文件夹 "' + folderName + '"；可用 email_list 重新获取 uid）')
+      }
+      const body = await parseRawMessage(full.source, this.settings.maxBodyChars)
+      signal?.throwIfAborted()
+      this.rememberRead(name, folderName, this.uidValidityOf(client), uid, { attachments: body.attachments, parts: collectAttachmentParts(full.bodyStructure) })
       return { account: name, uid, folder: folderName, ...body }
     }, true, signal)
   }
@@ -778,17 +1066,22 @@ export class EmailPool {
   async folders(accountName: string | undefined, subscribedOnly: boolean, signal?: AbortSignal): Promise<EmailFoldersResult> {
     const name = this.resolveName(accountName)
     return this.withImap(name, null, async (client) => {
-      const list = await client.list()
-      signal?.throwIfAborted()
-      const folders = list
-        .filter(row => !subscribedOnly || row.subscribed !== false)
-        .map(row => ({
+      const cached = this.folderCache.get(name)
+      let rows: EmailFolderRow[]
+      if (cached !== undefined && Date.now() - cached.at < FOLDER_CACHE_TTL_MS) {
+        rows = cached.folders
+      } else {
+        const list = await client.list()
+        signal?.throwIfAborted()
+        rows = list.map(row => ({
           name: row.name ?? row.path,
           path: row.path,
           specialUse: row.specialUse ?? '',
           subscribed: row.subscribed !== false,
         }))
-      return { account: name, folders }
+        this.folderCache.set(name, { at: Date.now(), folders: rows })
+      }
+      return { account: name, folders: rows.filter(row => !subscribedOnly || row.subscribed !== false) }
     }, true, signal)
   }
 
@@ -797,22 +1090,18 @@ export class EmailPool {
     const cfg = this.account(name)
     const folderName = folder || cfg.inboxFolder
     return this.withImap(name, folderName, async (client) => {
-      const message = await client.fetchOne(uid, { uid: true, bodyStructure: true, source: true }, { uid: true })
-      if (message === false || message.source === undefined) {
-        throw new MailError('找不到 uid=' + uid + ' 的邮件（可能已被删除，或不在文件夹 "' + folderName + '"）')
+      // The mailparser list is authoritative for the index email_read showed and
+      // the bodyStructure walk supplies the IMAP part to download. email_read
+      // already produced both in the usual read-then-download flow, so reuse that
+      // instead of pulling the whole message — attachments included — again.
+      const { attachments, parts } = await this.attachmentIndexOf(client, name, folderName, uid, signal)
+      if (attachments.length === 0) throw new MailError('该邮件没有附件')
+      if (attachments[index] === undefined) {
+        throw new MailError('附件序号 ' + index + ' 越界：共 ' + attachments.length + ' 个附件（序号从 0 开始，与 email_read 返回的 attachments 顺序一致）')
       }
-      // The mailparser list is authoritative for the index email_read showed;
-      // the bodyStructure walk supplies the IMAP part to download.
-      const body = await parseRawMessage(message.source, this.settings.maxBodyChars)
-      signal?.throwIfAborted()
-      const parts = collectAttachmentParts(message.bodyStructure)
-      if (body.attachments.length === 0) throw new MailError('该邮件没有附件')
-      if (body.attachments[index] === undefined) {
-        throw new MailError('附件序号 ' + index + ' 越界：共 ' + body.attachments.length + ' 个附件（序号从 0 开始，与 email_read 返回的 attachments 顺序一致）')
-      }
-      const att = selectAttachmentPart(body.attachments, parts, index)
+      const att = selectAttachmentPart(attachments, parts, index)
       if (att === undefined) {
-        throw new MailError('附件 #' + index + '（' + body.attachments[index].filename + '）无法在邮件结构中定位（可能是内嵌图片，暂不支持下载）')
+        throw new MailError('附件 #' + index + '（' + attachments[index].filename + '）无法在邮件结构中定位（可能是内嵌图片，暂不支持下载）')
       }
       if (att.size > this.settings.maxAttachmentBytes) {
         throw new MailError('附件 "' + att.filename + '" 大小 ' + att.size + ' 字节，超过上限 maxAttachmentBytes=' + this.settings.maxAttachmentBytes)
@@ -820,7 +1109,7 @@ export class EmailPool {
       const dl = await client.download(uid, att.part, { uid: true, maxBytes: this.settings.maxAttachmentBytes })
       signal?.throwIfAborted()
       const buf = await collectStream(dl.content, this.settings.maxAttachmentBytes, signal)
-      const safeName = sanitizeFilename(dl.meta.filename ?? att.filename ?? body.attachments[index].filename)
+      const safeName = sanitizeFilename(dl.meta.filename ?? att.filename ?? attachments[index].filename)
       // Default the destination to the session workspace so the model can
       // read the file back; an explicit downloadDir always wins.
       const dir = this.settings.downloadDirExplicit
@@ -842,7 +1131,7 @@ export class EmailPool {
     const cfg = this.account(name)
     const attachments = await validateAttachmentPaths(attachmentPaths ?? [], this.settings.maxAttachmentBytes, signal)
     const info = await this.sendMail(name, cfg, {
-      from: cfg.user,
+      from: senderOf(cfg),
       to,
       cc,
       subject,
@@ -875,13 +1164,15 @@ export class EmailPool {
       return buildReplyMessage(
         { from: body.from, to: body.to, cc: body.cc, subject: body.subject, date: body.date, text: body.text, messageId: ids.messageId, references: ids.references },
         mode,
-        cfg.user,
+        // Both the visible address and the login are "me": a reply-all that
+        // keeps either of them would mail the sender his own message.
+        cfg.authUser === cfg.user ? cfg.user : [cfg.user, cfg.authUser],
         text,
         forwardTo,
       )
     }, true, signal)
     const info = await this.sendMail(name, cfg, {
-      from: cfg.user,
+      from: senderOf(cfg),
       to: built.to,
       cc,
       subject: built.subject,

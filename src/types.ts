@@ -43,6 +43,8 @@ export interface EmailListResult {
   account: string
   count: number
   folder: string
+  /** The mailbox's UIDVALIDITY; 0 when the server did not report one. */
+  uidValidity: number
   messages: ListedMessage[]
 }
 
@@ -55,9 +57,16 @@ export interface EmailReadResult extends ReadMessageBody {
 export interface EmailSearchResult {
   account: string
   query: string
+  /** Server path: the server's match count. Fallback scan: this page's row count (see countKind). */
   count: number
   folder: string
+  /** How many newest matches the caller skipped (0 on the first page). */
+  offset: number
   messages: ListedMessage[]
+  /** Set to 'scanned' when the local body scan produced this page, so count is not a total. */
+  countKind?: 'scanned'
+  /** How many newest messages the fallback scan looked at (set with countKind='scanned'). */
+  scannedLimit?: number
 }
 
 export interface EmailSendResult {
@@ -113,6 +122,7 @@ export interface EmailSearchArgs extends AccountArg {
   query: string
   folder?: string
   limit?: number
+  offset?: number
   since?: string
   until?: string
 }
@@ -200,6 +210,8 @@ export interface EmailWatchResult {
   /** Unread messages never reported before (empty on firstRun). */
   newCount: number
   messages: ListedMessage[]
+  /** True when a server-side UIDVALIDITY change forced a fresh baseline. */
+  reset?: boolean
   /** Total unread in the folder right now. */
   totalUnread: number
 }

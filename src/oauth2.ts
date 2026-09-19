@@ -50,6 +50,14 @@ export const OAUTH2_REQUEST_TIMEOUT_MS = 15000
 /** The one message every「no token yet」path reports, so the fix is always the same. */
 export const NOT_LOGGED_IN_MESSAGE = '尚未登录：请先在设置页完成设备码登录'
 
+/**
+ * Reported when an OAuth2 account has nothing to log in through. The packaged
+ * build carries a community registration (OUTLOOK_OAUTH2_CLIENT_ID), so this
+ * only surfaces in a build that blanks it, or on an account whose own id was
+ * cleared while the built-in one is gone — it still says what to type.
+ */
+export const NO_CLIENT_ID_MESSAGE = '尚未配置 OAuth2 应用：当前构建没有内置公共客户端 ID，请在设置页该账号的「应用（客户端）ID」里填入一个（免费注册，步骤见 README 的「Outlook OAuth2」一节），否则无法开始设备码登录'
+
 /** Where the refresh/access tokens live. Kept out of the settings namespace on purpose. */
 export function oauth2TokenFile(): string {
   const home = process.env.DSH_HOME ?? join(homedir(), '.dsh')
@@ -258,12 +266,13 @@ export type OAuth2State = 'none' | 'pending' | 'logged-in'
  * the verdict is「none」and the user is sent through the flow again. An empty
  * configured address cannot disagree with anything and keeps the token.
  */
-export function oauth2StateOf(name: string, configuredUser?: string): { state: OAuth2State; user?: string } {
+export function oauth2StateOf(name: string, configuredUser?: string, configuredClientId?: string): { state: OAuth2State; user?: string } {
   const entry = readTokenStore().accounts[name]
   if (entry !== undefined) {
     const wanted = (configuredUser ?? '').trim()
     const hasToken = entry.user !== '' && wanted !== '' && entry.user.toLowerCase() !== wanted.toLowerCase()
-    if (!hasToken) return { state: 'logged-in', ...(entry.user !== '' ? { user: entry.user } : {}) }
+    const clientMatches = configuredClientId === undefined || entry.clientId === clientIdOf({ clientId: configuredClientId, user: configuredUser ?? '' })
+    if (!hasToken && clientMatches) return { state: 'logged-in', ...(entry.user !== '' ? { user: entry.user } : {}) }
   }
   const flow = pending.get(name)
   if (flow !== undefined) {
@@ -347,6 +356,10 @@ export async function startDeviceFlow(name: string, cfg: OAuth2AccountConfig): P
   if (running !== undefined) return await running
   const task = (async (): Promise<DeviceFlowStart> => {
     const clientId = clientIdOf(cfg)
+    // Refuse locally rather than letting the authority answer AADSTS700011
+    // (「application not found」), which tells the user nothing about the one
+    // field they have to fill in.
+    if (clientId === '') throw new OAuth2Error(NO_CLIENT_ID_MESSAGE)
     const { status, payload } = await postForm(DEVICE_CODE_URL, { client_id: clientId, scope: OAUTH2_SCOPE_TEXT })
     const doc = (payload !== null && typeof payload === 'object' ? payload : {}) as Record<string, unknown>
     if (status !== 200 || typeof doc.device_code !== 'string' || typeof doc.user_code !== 'string') {
@@ -430,6 +443,11 @@ export async function getFreshAccessToken(
   const entry = readTokenStore().accounts[name]
   if (entry === undefined) throw new OAuth2Error(NOT_LOGGED_IN_MESSAGE)
   const wanted = (cfg.user ?? '').trim()
+  const clientId = clientIdOf(cfg)
+  if (clientId === '') throw new OAuth2Error(NO_CLIENT_ID_MESSAGE)
+  if (entry.clientId !== clientId) {
+    throw new OAuth2Error('尚未登录：clientId 已更改，请先在设置页重新完成设备码登录')
+  }
   if (entry.user !== '' && wanted !== '' && entry.user.toLowerCase() !== wanted.toLowerCase()) {
     throw new OAuth2Error('尚未登录：账号地址已改为 ' + wanted + '，请先在设置页完成设备码登录')
   }

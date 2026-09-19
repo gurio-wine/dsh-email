@@ -18,7 +18,7 @@ const HOME = mkdtempSync(join(tmpdir(), 'dsh-email-oauth2-'))
 process.env.DSH_HOME = HOME
 
 const {
-  EmailPool, classifyOAuthFailure, clearTokenFor, getFreshAccessToken, imapAuthOf, isOAuth2Account,
+  EmailPool, classifyOAuthFailure, clearTokenFor, clientIdOf, getFreshAccessToken, imapAuthOf, isOAuth2Account,
   looksLikeAuthFailure, mapAadstsMessage, NOT_LOGGED_IN_MESSAGE, oauth2StateOf, oauth2TokenFile,
   OAUTH2_SCOPES, pollDeviceFlow, readTokenStore, resolveEmailSettings, smtpAuthOf, startDeviceFlow,
   writeTokenStore, ACCESS_TOKEN_MARGIN_MS, OUTLOOK_OAUTH2_CLIENT_ID, OAUTH2_RELOGIN_MESSAGE,
@@ -131,6 +131,7 @@ test('an outlook account resolves without a password, a password account still r
 test('clientId defaults to the built-in public client and is overridable per account', () => {
   const plain = resolveEmailSettings({ accountsYaml: 'work: { provider: outlook, user: w@outlook.com }\n' })
   assert.equal(plain.accounts.get('work').clientId, undefined, 'the default lives in oauth2.ts, not in every account')
+  assert.equal(clientIdOf({ user: 'w@outlook.com' }), OUTLOOK_OAUTH2_CLIENT_ID, 'so login falls back to the app the plugin ships')
 
   const custom = resolveEmailSettings({
     accountsYaml: 'work: { provider: outlook, user: w@outlook.com, clientId: my-own-app }\n',
@@ -141,18 +142,24 @@ test('clientId defaults to the built-in public client and is overridable per acc
 // --- auth shapes handed to the libraries -------------------------------------
 
 test('imapflow and nodemailer receive the OAuth2 auth shape, password accounts unchanged', () => {
-  const oauth = { user: 'me@outlook.com', password: '', authKind: 'oauth2' }
-  const password = { user: 'me@qq.com', password: 'secret', authKind: 'password' }
+  const oauth = { authUser: 'me@outlook.com', authPassword: '', authKind: 'oauth2' }
+  const password = { authUser: 'me@qq.com', authPassword: 'secret', authKind: 'password' }
 
   assert.deepEqual(imapAuthOf(oauth, 'access-token'), { user: 'me@outlook.com', accessToken: 'access-token' })
   assert.equal('pass' in imapAuthOf(oauth, 'access-token'), false, 'a password key would make imapflow try LOGIN')
   assert.deepEqual(imapAuthOf(password, undefined), { user: 'me@qq.com', pass: 'secret' })
 
-  // nodemailer needs the explicit XOAUTH2 mechanism: type 'OAuth2' alone would
-  // send it into its own refresh flow, which has no refresh token here.
+  // nodemailer resolves OAuth2 through XOAuth2, which reads `accessToken` and
+  // never `pass`: `smtp-transport.getAuth()` builds `new XOAuth2(authData)` for
+  // `type: 'OAuth2'`, and `getToken()` then reuses the token as-is when no
+  // refresh mechanism is configured. Handing it `pass` instead leaves
+  // `accessToken` false and every send dies with EAUTH「Can't create new access
+  // token for user」. Verified against a fixture SMTP server: the `pass` shape
+  // fails, this shape delivers `user=…\x01auth=Bearer …\x01\x01`.
   assert.deepEqual(smtpAuthOf(oauth, 'access-token'), {
-    type: 'OAuth2', method: 'XOAUTH2', user: 'me@outlook.com', pass: 'access-token',
+    type: 'OAuth2', user: 'me@outlook.com', accessToken: 'access-token',
   })
+  assert.equal('pass' in smtpAuthOf(oauth, 'access-token'), false, 'a password key would be ignored by XOAuth2 and mask a missing token')
   assert.deepEqual(smtpAuthOf(password, undefined), { user: 'me@qq.com', pass: 'secret' })
 })
 
@@ -393,7 +400,7 @@ test('a token issued for another address is refused, and an expired one is repor
     },
   })
   await assert.rejects(
-    getFreshAccessToken('moved', { user: 'new@outlook.com' }),
+    getFreshAccessToken('moved', { user: 'new@outlook.com', clientId: 'client-1' }),
     /账号地址已改为 new@outlook\.com/,
   )
   // The card must not claim a login the tools will refuse either: the verdict
@@ -500,7 +507,7 @@ test('the token file never appears in the settings YAML or the pool fingerprint 
   // The credential lives outside the resolved settings entirely: a scan of the
   // resolved account finds no token material, which is what keeps it out of the
   // pool fingerprint (and therefore out of any reconnect decision).
-  const resolved = resolveEmailSettings({ accountsYaml: 'work: { provider: outlook, user: me@outlook.com }\n' })
+  const resolved = resolveEmailSettings({ accountsYaml: 'work: { provider: outlook, user: me@outlook.com, clientId: client-1 }\n' })
   const serialized = JSON.stringify([...resolved.accounts.entries()])
   assert.equal(serialized.includes('SECRET-REFRESH'), false)
   assert.equal(serialized.includes('SECRET-ACCESS'), false)
@@ -511,7 +518,7 @@ test('the token file never appears in the settings YAML or the pool fingerprint 
 
 test('an OAuth2 account without a token fails with the settings-page message and never dials', async t => {
   writeTokens({})
-  const settings = resolveEmailSettings({ accountsYaml: 'work: { provider: outlook, user: me@outlook.com }\n' })
+  const settings = resolveEmailSettings({ accountsYaml: 'work: { provider: outlook, user: me@outlook.com, clientId: client-1 }\n' })
   const pool = new EmailPool(settings)
   let dialled = false
   pool.createImap = () => { dialled = true; return { usable: true, async connect() {}, async logout() {}, close() {} } }
@@ -538,7 +545,7 @@ test('an OAuth2 connection hands imapflow the token, and retries once after an a
       accessToken: 'stale-token', expiresAt: Date.now() + 3600_000,
     },
   })
-  const settings = resolveEmailSettings({ accountsYaml: 'work: { provider: outlook, user: me@outlook.com }\n' })
+  const settings = resolveEmailSettings({ accountsYaml: 'work: { provider: outlook, user: me@outlook.com, clientId: client-1 }\n' })
   const pool = new EmailPool(settings)
   const auths = []
   let connects = 0
@@ -591,7 +598,7 @@ test('an OAuth2 account whose refresh token is dead reports the re-login message
       accessToken: 'stale', expiresAt: Date.now() + 3600_000,
     },
   })
-  const settings = resolveEmailSettings({ accountsYaml: 'work: { provider: outlook, user: me@outlook.com }\n' })
+  const settings = resolveEmailSettings({ accountsYaml: 'work: { provider: outlook, user: me@outlook.com, clientId: client-1 }\n' })
   const pool = new EmailPool(settings)
   pool.createImap = auth => ({
     usable: true,
@@ -615,7 +622,7 @@ test('the SMTP transporter is rebuilt with a fresh token after a rejection', asy
       accessToken: 'smtp-stale', expiresAt: Date.now() + 3600_000,
     },
   })
-  const settings = resolveEmailSettings({ accountsYaml: 'work: { provider: outlook, user: me@outlook.com }\n' })
+  const settings = resolveEmailSettings({ accountsYaml: 'work: { provider: outlook, user: me@outlook.com, clientId: client-1 }\n' })
   const pool = new EmailPool(settings)
   const auths = []
   let sends = 0
@@ -633,9 +640,14 @@ test('the SMTP transporter is rebuilt with a fresh token after a rejection', asy
   const calls = mockFetch(t, () => jsonResponse(tokenPayload({ access_token: 'smtp-fresh' })))
   const info = await pool.send('work', 'to@x.y', 'subject', 'body', undefined, [])
   assert.equal(sends, 2, 'an SMTP credential rejection is retried once')
-  assert.equal(auths[0].pass, 'smtp-stale')
-  assert.equal(auths[1].pass, 'smtp-fresh')
-  assert.equal(auths[1].method, 'XOAUTH2')
+  assert.equal(auths[0].accessToken, 'smtp-stale')
+  assert.equal(auths[1].accessToken, 'smtp-fresh')
+  // The mechanism is nodemailer's to pick: `smtp-transport.getAuth()` sets
+  // method XOAUTH2 itself for `type: 'OAuth2'`, and XOAuth2 reads `accessToken`
+  // (never `pass`), so the plugin declares the token and nothing else.
+  assert.equal(auths[1].type, 'OAuth2')
+  assert.equal('pass' in auths[1], false, 'a pass key would be ignored by XOAuth2')
+  assert.equal('method' in auths[1], false, 'nodemailer derives the mechanism from type')
   assert.equal(info.accepted[0], 'to@x.y')
   assert.equal(calls.length, 1)
   pool.dispose()
@@ -661,7 +673,7 @@ test('a non-auth SMTP failure is reported as itself and is not retried', async t
       accessToken: 'good', expiresAt: Date.now() + 3600_000,
     },
   })
-  const settings = resolveEmailSettings({ accountsYaml: 'work: { provider: outlook, user: me@outlook.com }\n' })
+  const settings = resolveEmailSettings({ accountsYaml: 'work: { provider: outlook, user: me@outlook.com, clientId: client-1 }\n' })
   const pool = new EmailPool(settings)
   let sends = 0
   pool.transporter = () => ({
@@ -682,6 +694,27 @@ test('the re-login message is the one the tools surface, and it says not to look
   assert.match(NOT_LOGGED_IN_MESSAGE, /设置页/)
 })
 
-test('the default client id is the built-in public client', () => {
+test('the built-in community application is the default, and an account can override it', async t => {
+  // Registering an application is a wall in front of the one provider where
+  // OAuth2 cannot be avoided, so the plugin ships the registration contributed
+  // by gurio-wine (used with permission, credited in the README). Pinned here
+  // because the value decides whose consent screen and whose tenant a user ends
+  // up in — a silent swap must not ride along in a release.
   assert.equal(OUTLOOK_OAUTH2_CLIENT_ID, '15dcd5aa-00dd-487f-82d7-1d2b2c299e14')
+  assert.equal(clientIdOf({ user: 'fixture@outlook.com' }), OUTLOOK_OAUTH2_CLIENT_ID,
+    'an account that names no application logs in through the built-in one')
+
+  writeTokens({})
+  const calls = mockFetch(t, () => jsonResponse(DEVICE_OK))
+  const start = await startDeviceFlow('work', { user: 'fixture@outlook.com' })
+  assert.equal(start.code, 'ABCD-EFGH')
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].params.client_id, OUTLOOK_OAUTH2_CLIENT_ID, 'the built-in app is what the authority is asked for')
+
+  // The same account with an id of its own starts the flow through that one.
+  const own = mockFetch(t, () => jsonResponse(DEVICE_OK))
+  const custom = await startDeviceFlow('work', { user: 'fixture@outlook.com', clientId: 'own-app' })
+  assert.equal(custom.code, 'ABCD-EFGH')
+  assert.equal(own.length, 1)
+  assert.equal(own[0].params.client_id, 'own-app', 'an account that names one overrides the built-in app')
 })
